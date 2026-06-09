@@ -1,0 +1,10 @@
+[Unit]
+Description=OpenVPN SSO Browser Trigger
+
+[Path]
+PathChanged=/run/nm-openvpn-sso
+TriggerLimitIntervalSec=5s
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=default.target

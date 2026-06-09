@@ -1,6 +1,6 @@
 [package]
 name = "nm-openvpn-sso"
-version = "0.3.0"
+version = "0.3.3"
 edition = "2021"
 authors = ["Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"]
 license = "MIT"
@@ -26,13 +26,10 @@ axum = "0.7"
 tower = "0.4"
 
 # HTTP client for forwarding OAuth code to VPN server
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 
 # Secrets/keyring
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
-
-# Browser opening
-open = "5"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -80,6 +77,8 @@ assets = [
     ["data/vpn-sso-connect.sh", "/usr/bin/vpn-sso-connect", "755"],
     ["data/vpn-sso-connect.desktop", "/usr/share/applications/vpn-sso-connect.desktop", "644"],
     ["LICENSE", "/usr/share/doc/networkmanager-openvpn-sso/LICENSE", "644"],
+    ["data/openvpn-sso-browser.path", "/usr/lib/systemd/user/openvpn-sso-browser.path", "644"],
+    ["data/openvpn-sso-browser.service", "/usr/lib/systemd/user/openvpn-sso-browser.service", "644"],
 ]
 
 # RPM package configuration (cargo-generate-rpm)
@@ -93,7 +92,12 @@ assets = [
     { source = "data/vpn-sso-connect.sh", dest = "/usr/bin/vpn-sso-connect", mode = "755" },
     { source = "data/vpn-sso-connect.desktop", dest = "/usr/share/applications/vpn-sso-connect.desktop", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/networkmanager-openvpn-sso/LICENSE", mode = "644", doc = true },
+    { source = "plasma-nm-plugin/build/plasmanetworkmanagement_openvpnssoui.so", dest = "/usr/lib64/qt6/plugins/plasma/network/vpn/plasmanetworkmanagement_openvpnssoui.so", mode = "755" },
+    { source = "data/openvpn-sso-browser.path", dest = "/usr/lib/systemd/user/openvpn-sso-browser.path", mode = "644" },
+    { source = "data/openvpn-sso-browser.service", dest = "/usr/lib/systemd/user/openvpn-sso-browser.service", mode = "644" },
 ]
+post_install_script = "mkdir -p /usr/lib/systemd/user/default.target.wants && ln -sf ../openvpn-sso-browser.path /usr/lib/systemd/user/default.target.wants/openvpn-sso-browser.path"
+pre_uninstall_script = "rm -f /usr/lib/systemd/user/default.target.wants/openvpn-sso-browser.path"
 
 [package.metadata.generate-rpm.requires]
 NetworkManager = "*"

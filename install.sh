@@ -74,6 +74,13 @@ install -m 755 data/vpn-sso-connect.sh "$BIN_DIR/vpn-sso-connect"
 info "Installing desktop entry..."
 install -m 644 data/vpn-sso-connect.desktop "$DESKTOP_DIR/"
 
+# Install systemd user units for browser launch (SELinux-compatible IPC)
+info "Installing systemd user units..."
+install -m 644 data/openvpn-sso-browser.path "$PREFIX/lib/systemd/user/"
+install -m 644 data/openvpn-sso-browser.service "$PREFIX/lib/systemd/user/"
+mkdir -p "$PREFIX/lib/systemd/user/default.target.wants"
+ln -sf ../openvpn-sso-browser.path "$PREFIX/lib/systemd/user/default.target.wants/openvpn-sso-browser.path"
+
 # Build and install plasma-nm plugin if KDE dependencies are available
 PLASMA_INSTALLED=false
 if command -v cmake &> /dev/null && pkg-config --exists "KF6NetworkManagerQt" 2>/dev/null && [[ -f "$LIBDIR/libplasmanm_editor.so" ]]; then

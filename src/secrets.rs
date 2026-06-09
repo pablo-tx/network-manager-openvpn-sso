@@ -217,6 +217,25 @@ pub async fn get_cached_credentials(connection_uuid: &str) -> Option<StoredToken
     }
 }
 
+/// Clear cached credentials (called when they are rejected by the server)
+pub async fn clear_cached_credentials(connection_uuid: &str) {
+    // Clear keyring
+    if let Ok(store) = SecretStore::new().await {
+        if let Err(e) = store.delete_tokens(connection_uuid).await {
+            debug!("Failed to delete keyring tokens: {}", e);
+        }
+    }
+    // Clear file cache
+    let cache_file = get_cache_file_path(connection_uuid);
+    if let Err(e) = tokio::fs::remove_file(&cache_file).await {
+        debug!("Failed to delete file cache: {}", e);
+    }
+    info!(
+        "Cleared cached credentials for connection {}",
+        connection_uuid
+    );
+}
+
 /// Store credentials after successful auth
 pub async fn cache_credentials(connection_uuid: &str, tokens: StoredTokens) -> Result<()> {
     // Try keyring first
@@ -248,10 +267,7 @@ fn get_cache_file_path(connection_uuid: &str) -> PathBuf {
 }
 
 /// Store credentials in a file (fallback when keyring unavailable)
-async fn store_file_cached_credentials(
-    connection_uuid: &str,
-    tokens: &StoredTokens,
-) -> Result<()> {
+async fn store_file_cached_credentials(connection_uuid: &str, tokens: &StoredTokens) -> Result<()> {
     let cache_dir = PathBuf::from(CACHE_DIR);
 
     // Create cache directory if it doesn't exist
@@ -283,10 +299,7 @@ async fn store_file_cached_credentials(
         std::fs::set_permissions(&cache_file, perms)?;
     }
 
-    info!(
-        "Stored credentials in file cache: {}",
-        cache_file.display()
-    );
+    info!("Stored credentials in file cache: {}", cache_file.display());
     Ok(())
 }
 

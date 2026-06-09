@@ -4,12 +4,14 @@
 //! OpenVPN process management and management interface protocol
 
 use anyhow::{anyhow, Context, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
 
 use crate::config::ConnectionConfig;
@@ -85,11 +87,21 @@ pub struct OpenVpnManager {
     /// Auth token received from server after successful authentication
     /// This can be used for reconnection without browser auth
     auth_token: Option<String>,
+    /// Path to a sanitized temp config file (if we created one)
+    temp_config_path: Option<PathBuf>,
+    /// Whether to skip cached credentials on next connect attempt
+    skip_cached_credentials: bool,
+    /// Stop signal — triggered by disconnect() to break the management loop
+    /// without needing to lock the manager mutex first.
+    pub stop: Arc<Notify>,
 }
 
 impl OpenVpnManager {
     pub fn new(config: ConnectionConfig, event_tx: mpsc::Sender<VpnEvent>) -> Self {
-        let socket_path = PathBuf::from(format!("/tmp/nm-openvpn-sso-{}.sock", config.uuid));
+        // Use /run/nm-openvpn-sso/ instead of /tmp to avoid SELinux denials
+        // on Fedora/RHEL where openvpn is confined and cannot create sockets in /tmp.
+        let runtime_dir = PathBuf::from("/run/nm-openvpn-sso");
+        let socket_path = runtime_dir.join(format!("nm-openvpn-sso-{}.sock", config.uuid));
 
         Self {
             config,
@@ -99,25 +111,95 @@ impl OpenVpnManager {
             pending_auth_url: None,
             sso_auth_initiated: false,
             auth_token: None,
+            temp_config_path: None,
+            skip_cached_credentials: false,
+            stop: Arc::new(Notify::new()),
         }
     }
 
-    /// Start OpenVPN and manage the connection
-    pub async fn connect(&mut self) -> Result<()> {
+    /// Start OpenVPN process and wait for management socket.
+    /// Returns the management stream (reader, writer).
+    async fn start_openvpn(
+        &mut self,
+    ) -> Result<(
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    )> {
         // Kill any stale openvpn processes using the same management socket
         self.kill_stale_openvpn_processes().await;
+
+        // Ensure runtime directory exists (SELinux-friendly location)
+        if let Some(parent) = self.socket_path.parent() {
+            if !parent.exists() {
+                info!("Creating runtime directory: {}", parent.display());
+                match tokio::fs::create_dir_all(parent).await {
+                    Ok(()) => {
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create runtime directory {}: {}",
+                            parent.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         // Clean up old socket if exists
         let _ = tokio::fs::remove_file(&self.socket_path).await;
 
         // Build OpenVPN arguments
-        let args = self
+        let mut args = self
             .config
             .build_openvpn_args(self.socket_path.to_str().unwrap());
 
+        // If using --config, strip any management directives from the .ovpn file
+        if let Some(ref config_path) = self.config.config_path {
+            match tokio::fs::read_to_string(config_path).await {
+                Ok(contents) => {
+                    if contents.lines().any(|l| {
+                        let trimmed = l.trim_start();
+                        trimmed.starts_with("management") || trimmed.starts_with("<management>")
+                    }) {
+                        info!("Config file contains management directive, creating sanitized temp copy");
+                        let sanitized: String = contents
+                            .lines()
+                            .filter(|l| {
+                                let trimmed = l.trim_start();
+                                !trimmed.starts_with("management")
+                                    && !trimmed.starts_with("<management>")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let temp_path = format!("/tmp/nm-openvpn-sso-{}.ovpn", self.config.uuid);
+                        match tokio::fs::write(&temp_path, sanitized).await {
+                            Ok(()) => {
+                                if let Some(pos) = args.iter().position(|a| a == "--config") {
+                                    if pos + 1 < args.len() {
+                                        args[pos + 1] = temp_path.clone();
+                                    }
+                                }
+                                self.temp_config_path = Some(PathBuf::from(temp_path));
+                            }
+                            Err(e) => {
+                                warn!("Failed to write sanitized config: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read config file for sanitization: {}", e);
+                }
+            }
+        }
+
         info!("Starting OpenVPN with args: {:?}", args);
 
-        // Start OpenVPN process
         let child = Command::new("openvpn")
             .args(&args)
             .stdin(Stdio::null())
@@ -130,12 +212,61 @@ impl OpenVpnManager {
         info!("OpenVPN started with PID: {:?}", pid);
 
         self.process = Some(child);
-
-        // Wait for management socket to be ready
         self.wait_for_socket().await?;
 
-        // Connect to management interface and handle events
-        self.run_management_loop().await
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .context("Failed to connect to management socket")?;
+
+        let (reader, writer) = stream.into_split();
+        Ok((BufReader::new(reader), writer))
+    }
+
+    /// Start OpenVPN and manage the connection.
+    /// Automatically retries with empty credentials if cached tokens are rejected.
+    pub async fn connect(&mut self) -> Result<()> {
+        // Try up to 2 times: first with cached credentials, then with empty
+        for attempt in 0..2 {
+            if attempt == 1 {
+                info!("Retrying connection with empty credentials (cached token was rejected)");
+                self.pending_auth_url = None;
+                self.sso_auth_initiated = false;
+                self.skip_cached_credentials = true;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+
+            let (reader, writer) = match self.start_openvpn().await {
+                Ok(rw) => rw,
+                Err(e) => {
+                    if attempt == 0 {
+                        warn!("Failed to start OpenVPN: {}", e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+
+            match self.run_management_loop_with_stream(reader, writer).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt == 0 && e.to_string().contains("CACHED_TOKEN_REJECTED") {
+                        // Kill the current OpenVPN process before retry
+                        if let Some(mut proc) = self.process.take() {
+                            let _ = proc.kill().await;
+                            let _ = proc.wait().await;
+                        }
+                        if let Some(ref temp_path) = self.temp_config_path {
+                            let _ = tokio::fs::remove_file(temp_path).await;
+                            self.temp_config_path = None;
+                        }
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(anyhow!("Connection failed after retry"))
     }
 
     /// Kill any stale openvpn processes that reference our management socket path.
@@ -165,21 +296,36 @@ impl OpenVpnManager {
             // Check if OpenVPN has already exited (e.g., config error)
             if let Some(ref mut child) = self.process {
                 if let Ok(Some(status)) = child.try_wait() {
+                    // Read both stdout and stderr — OpenVPN logs errors to either
+                    let mut stdout_msg = String::new();
                     let mut stderr_msg = String::new();
+
+                    if let Some(mut stdout) = child.stdout.take() {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = Vec::new();
+                        let _ = stdout.read_to_end(&mut buf).await;
+                        stdout_msg = String::from_utf8_lossy(&buf).to_string();
+                    }
                     if let Some(mut stderr) = child.stderr.take() {
                         use tokio::io::AsyncReadExt;
                         let mut buf = Vec::new();
                         let _ = stderr.read_to_end(&mut buf).await;
                         stderr_msg = String::from_utf8_lossy(&buf).to_string();
                     }
+
                     error!("OpenVPN exited early with status: {}", status);
+                    if !stdout_msg.is_empty() {
+                        error!("OpenVPN stdout: {}", stdout_msg);
+                    }
                     if !stderr_msg.is_empty() {
                         error!("OpenVPN stderr: {}", stderr_msg);
                     }
+
+                    let combined = format!("stdout: {} stderr: {}", stdout_msg, stderr_msg);
                     return Err(anyhow!(
-                        "OpenVPN exited with status {} before creating management socket. stderr: {}",
+                        "OpenVPN exited with status {} before creating management socket. {}",
                         status,
-                        stderr_msg
+                        combined
                     ));
                 }
             }
@@ -188,14 +334,74 @@ impl OpenVpnManager {
         Err(anyhow!("Management socket not created after 5s"))
     }
 
-    /// Main management interface loop
-    async fn run_management_loop(&mut self) -> Result<()> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .context("Failed to connect to management socket")?;
+    /// Wait for the server to send an SSO URL via management messages.
+    /// Reads messages from the management interface for up to 60 seconds.
+    async fn wait_for_sso_url(&mut self, reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) {
+        let wait_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(60);
+        let mut next_line = String::new();
 
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
+        while self.pending_auth_url.is_none() && wait_start.elapsed() < max_wait {
+            next_line.clear();
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                reader.read_line(&mut next_line),
+            )
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    let line = next_line.trim();
+                    info!("MGMT (waiting for SSO): {}", line);
+
+                    if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
+                        let info = line
+                            .strip_prefix(">INFO:")
+                            .or_else(|| line.strip_prefix(">INFOMSG:"))
+                            .unwrap_or(line);
+                        info!("Server INFO/MSG: {}", info);
+                        if let Some(url) = extract_auth_url(info) {
+                            info!("Received auth URL from server: {}", url);
+                            self.pending_auth_url = Some(url);
+                        }
+                    } else if line.starts_with(">PASSWORD:Verification Failed") {
+                        info!("Auth verification failed - checking for SSO URL");
+                        if let Some(url) = extract_auth_url(line) {
+                            info!("Found auth URL in verification failure: {}", url);
+                            self.pending_auth_url = Some(url);
+                        }
+                    } else if line.contains(">STATE:") && line.contains(",CONNECTED,") {
+                        info!("Connection established without SSO");
+                        break;
+                    } else if line.contains("WEB_AUTH::") {
+                        if let Some(url) = extract_auth_url(line) {
+                            info!("Found auth URL in message: {}", url);
+                            self.pending_auth_url = Some(url);
+                        }
+                    }
+                }
+                Ok(Ok(_)) => break,
+                Ok(Err(e)) => {
+                    warn!("Error reading during SSO wait: {}", e);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if self.pending_auth_url.is_none() && wait_start.elapsed() >= max_wait {
+            warn!(
+                "Timeout waiting for SSO URL from server after {:?}",
+                wait_start.elapsed()
+            );
+        }
+    }
+
+    /// Main management interface loop using a pre-connected stream
+    async fn run_management_loop_with_stream(
+        &mut self,
+        mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+        mut writer: tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<()> {
         let mut line = String::new();
 
         // State tracking
@@ -204,9 +410,17 @@ impl OpenVpnManager {
         let mut used_cached_token = false;
 
         // Check for cached credentials before starting
-        let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
+        let cached_token = if self.skip_cached_credentials {
+            info!("Skipping cached credentials (previous attempt rejected)");
+            None
+        } else {
+            secrets::get_cached_credentials(&self.config.uuid).await
+        };
         if cached_token.is_some() {
-            info!("Found cached credentials for connection {}", self.config.uuid);
+            info!(
+                "Found cached credentials for connection {}",
+                self.config.uuid
+            );
         }
 
         // Send initial commands
@@ -220,11 +434,19 @@ impl OpenVpnManager {
 
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).await?;
-
-            if n == 0 {
-                warn!("Management connection closed");
-                break;
+            tokio::select! {
+                result = reader.read_line(&mut line) => {
+                    let n = result?;
+                    if n == 0 {
+                        warn!("Management connection closed");
+                        break;
+                    }
+                }
+                _ = self.stop.notified() => {
+                    info!("Received stop signal, exiting management loop");
+                    let _ = writer.write_all(b"signal SIGTERM\n").await;
+                    break;
+                }
             }
 
             let line = line.trim();
@@ -239,17 +461,14 @@ impl OpenVpnManager {
                 // Format: >PASSWORD:Auth-Token:SESS_ID_AT_...
                 if auth_type.starts_with("Auth-Token:") {
                     let token = auth_type.strip_prefix("Auth-Token:").unwrap().trim();
-                    info!(
-                        "Received Auth-Token from server (length: {})",
-                        token.len()
-                    );
+                    info!("Received Auth-Token from server (length: {})", token.len());
                     if !token.is_empty() {
                         self.auth_token = Some(token.to_string());
                     }
                     continue;
                 }
 
-                // Check if this is a verification failure (contains URL)
+                // Check if this is a verification failure or auth pending (contains URL)
                 if auth_type.contains("Verification Failed") || auth_type.contains("AUTH_PENDING") {
                     // Server is responding to our initial auth - look for URL
                     if let Some(url) = extract_auth_url(auth_type) {
@@ -275,11 +494,55 @@ impl OpenVpnManager {
                                 .ok();
                             return Err(e);
                         }
-                    } else {
-                        error!("Verification failed but no auth URL found in response");
-                        return Err(anyhow!(
-                            "Auth verification failed without providing SSO URL"
-                        ));
+                    } else if !initial_auth_sent {
+                        // Server rejected empty/default credentials before we sent any.
+                        // Send placeholder credentials now and wait for the SSO URL.
+                        warn!(
+                            "Server sent '{}' before credentials were sent; sending placeholder credentials now",
+                            auth_type
+                        );
+
+                        let username = self.config.username.as_deref().unwrap_or("oauth");
+                        let password = self.config.password.as_deref().unwrap_or("oauth");
+                        writer
+                            .write_all(format!("username \"Auth\" \"{}\"\n", username).as_bytes())
+                            .await?;
+                        writer
+                            .write_all(format!("password \"Auth\" \"{}\"\n", password).as_bytes())
+                            .await?;
+                        writer.flush().await?;
+
+                        initial_auth_sent = true;
+                        info!("Sent placeholder credentials, waiting for server response...");
+
+                        self.wait_for_sso_url(&mut reader).await;
+
+                        if let Some(url) = self.pending_auth_url.clone() {
+                            info!("Got SSO URL after retry, starting browser authentication");
+                            self.event_tx
+                                .send(VpnEvent::AuthRequired {
+                                    auth_url: Some(url.clone()),
+                                })
+                                .await
+                                .ok();
+
+                            if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
+                                error!("SSO authentication failed: {}", e);
+                                self.event_tx
+                                    .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
+                                    .await
+                                    .ok();
+                                return Err(e);
+                            }
+                        } else {
+                            warn!("No SSO URL received after sending placeholder credentials");
+                        }
+                    } else if used_cached_token {
+                        // Cached credentials were rejected. Clear them so the
+                        // next attempt uses empty credentials and triggers SSO.
+                        warn!("Cached credentials rejected; clearing cache");
+                        secrets::clear_cached_credentials(&self.config.uuid).await;
+                        return Err(anyhow!("CACHED_TOKEN_REJECTED"));
                     }
                     continue;
                 }
@@ -342,74 +605,8 @@ impl OpenVpnManager {
                         initial_auth_sent = true;
                         info!("Sent placeholder credentials, waiting for server response...");
 
-                        // Now wait for server response - it should send back AUTH_PENDING or WEB_AUTH
-                        let wait_start = std::time::Instant::now();
-                        let max_wait = std::time::Duration::from_secs(60); // Longer timeout for TLS + server response
-
-                        while self.pending_auth_url.is_none() && wait_start.elapsed() < max_wait {
-                            // Try to read more messages with a short timeout
-                            let mut next_line = String::new();
-                            match tokio::time::timeout(
-                                std::time::Duration::from_millis(500),
-                                reader.read_line(&mut next_line),
-                            )
-                            .await
-                            {
-                                Ok(Ok(n)) if n > 0 => {
-                                    let next_line = next_line.trim();
-                                    info!("MGMT (waiting for SSO): {}", next_line);
-
-                                    // Check for INFO or INFOMSG with auth URL
-                                    if next_line.starts_with(">INFO:")
-                                        || next_line.starts_with(">INFOMSG:")
-                                    {
-                                        let info = next_line
-                                            .strip_prefix(">INFO:")
-                                            .or_else(|| next_line.strip_prefix(">INFOMSG:"))
-                                            .unwrap_or(next_line);
-                                        info!("Server INFO/MSG: {}", info);
-                                        if let Some(url) = extract_auth_url(info) {
-                                            info!("Received auth URL from server: {}", url);
-                                            self.pending_auth_url = Some(url);
-                                        }
-                                    }
-                                    // Check for PASSWORD verification failure with URL
-                                    else if next_line.starts_with(">PASSWORD:Verification Failed")
-                                    {
-                                        info!("Auth verification failed - checking for SSO URL");
-                                        if let Some(url) = extract_auth_url(next_line) {
-                                            info!(
-                                                "Found auth URL in verification failure: {}",
-                                                url
-                                            );
-                                            self.pending_auth_url = Some(url);
-                                        }
-                                    }
-                                    // Check for state that indicates connected (no SSO needed)
-                                    else if next_line.contains(">STATE:")
-                                        && next_line.contains(",CONNECTED,")
-                                    {
-                                        info!("Connection established without SSO");
-                                        break;
-                                    }
-                                    // Also check any line for WEB_AUTH URL pattern
-                                    else if next_line.contains("WEB_AUTH::") {
-                                        if let Some(url) = extract_auth_url(next_line) {
-                                            info!("Found auth URL in message: {}", url);
-                                            self.pending_auth_url = Some(url);
-                                        }
-                                    }
-                                    // Auth password entered is not the end - server may still send SSO URL
-                                    // so we continue waiting
-                                }
-                                Ok(Ok(_)) => break, // Connection closed
-                                Ok(Err(e)) => {
-                                    warn!("Error reading during SSO wait: {}", e);
-                                    break;
-                                }
-                                Err(_) => continue, // Timeout, keep waiting
-                            }
-                        }
+                        // Wait for server to send SSO URL
+                        self.wait_for_sso_url(&mut reader).await;
 
                         // If we got an auth URL, do browser auth
                         if let Some(url) = self.pending_auth_url.clone() {
@@ -429,13 +626,9 @@ impl OpenVpnManager {
                                     .ok();
                                 return Err(e);
                             }
-                        } else if wait_start.elapsed() >= max_wait {
-                            warn!(
-                                "Timeout waiting for SSO URL from server after {:?}",
-                                wait_start.elapsed()
-                            );
-                            // Server might not support SSO or accepted placeholder credentials
-                            info!("Server did not send SSO URL - may have accepted placeholder or not configured for SSO");
+                        } else {
+                            warn!("No SSO URL received from server after sending credentials");
+                            info!("Server may have accepted placeholder credentials or does not support SSO");
                         }
                         continue;
                     }
@@ -502,37 +695,66 @@ impl OpenVpnManager {
                                     .await
                                     .ok();
 
-                                // Start localhost callback server + open browser for SSO
                                 if !self.sso_auth_initiated {
                                     self.sso_auth_initiated = true;
 
-                                    // Extract server base URL from auth URL for POSTing back
-                                    let server_base = match url::Url::parse(&url) {
-                                        Ok(u) => format!("{}://{}:{}", u.scheme(),
-                                            u.host_str().unwrap_or(""),
-                                            u.port().unwrap_or(9000)),
-                                        Err(e) => {
-                                            error!("Failed to parse auth URL: {}", e);
-                                            url.clone()
-                                        },
-                                    };
+                                    // Detect flow type: native OpenVPN webauth vs localhost callback
+                                    let uses_localhost_callback = url
+                                        .contains("redirect_uri=http://127.0.0.1")
+                                        || url.contains("redirect_uri=http://localhost")
+                                        || url.contains("redirect_uri=https://127.0.0.1")
+                                        || url.contains("redirect_uri=https://localhost");
 
-                                    // Spawn the SSO flow (localhost server + browser + POST)
-                                    // in a background task so the management loop continues
-                                    let url_clone = url.clone();
-                                    tokio::spawn(async move {
-                                        match crate::oauth::authenticate_sso(
-                                            &url_clone, &server_base
-                                        ).await {
-                                            Ok(()) => info!("SSO authentication completed successfully"),
-                                            Err(e) => error!("SSO authentication failed: {}", e),
-                                        }
-                                    });
+                                    if uses_localhost_callback {
+                                        // Callback flow: start localhost server in background
+                                        let server_base = match url::Url::parse(&url) {
+                                            Ok(u) => format!(
+                                                "{}://{}:{}",
+                                                u.scheme(),
+                                                u.host_str().unwrap_or(""),
+                                                u.port().unwrap_or(9000)
+                                            ),
+                                            Err(e) => {
+                                                error!("Failed to parse auth URL: {}", e);
+                                                url.clone()
+                                            }
+                                        };
+                                        let url_clone = url.clone();
+                                        tokio::spawn(async move {
+                                            match crate::oauth::authenticate_sso(
+                                                &url_clone,
+                                                &server_base,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    info!("SSO localhost-callback flow completed")
+                                                }
+                                                Err(e) => error!(
+                                                    "SSO localhost-callback flow failed: {}",
+                                                    e
+                                                ),
+                                            }
+                                        });
+                                    } else {
+                                        // Native OpenVPN webauth: just open browser
+                                        let url_clone = url.clone();
+                                        tokio::spawn(async move {
+                                            match crate::oauth::authenticate(&url_clone, None).await
+                                            {
+                                                Ok(_) => info!("Browser opened for native webauth"),
+                                                Err(e) => error!("Failed to open browser: {}", e),
+                                            }
+                                        });
+                                    }
                                 } else {
                                     info!("SSO auth already initiated, skipping duplicate");
                                 }
                             } else {
-                                warn!("AUTH_PENDING state but no OPEN_URL found in: {}", full_state);
+                                warn!(
+                                    "AUTH_PENDING state but no OPEN_URL found in: {}",
+                                    full_state
+                                );
                             }
 
                             self.event_tx
@@ -699,27 +921,57 @@ impl OpenVpnManager {
         info!("Starting SSO authentication with URL: {}", auth_url);
         self.sso_auth_initiated = true;
 
-        // Extract the VPN server host from the auth URL for later POSTing
-        // auth_url looks like: http://34.214.23.25:9000/auth/start?state=...
-        let server_base_url = match url::Url::parse(auth_url) {
-            Ok(u) => format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), u.port().unwrap_or(9000)),
-            Err(_) => {
-                self.sso_auth_initiated = false;
-                return Err(anyhow!("Invalid auth URL: {}", auth_url));
-            }
-        };
-
-        // Start the localhost callback server and open the browser concurrently
         use crate::oauth;
-        match oauth::authenticate_sso(auth_url, &server_base_url).await {
-            Ok(()) => {
-                info!("SSO authentication flow completed");
-                Ok(())
+
+        // Detect which SSO flow the server uses:
+        // - Native OpenVPN webauth: URL has no localhost redirect_uri;
+        //   server completes auth through the VPN tunnel. Just open browser.
+        // - Callback flow: URL contains redirect_uri=127.0.0.1 or localhost;
+        //   we must start a localhost HTTP server to receive the code.
+        let uses_localhost_callback = auth_url.contains("redirect_uri=http://127.0.0.1")
+            || auth_url.contains("redirect_uri=http://localhost")
+            || auth_url.contains("redirect_uri=https://127.0.0.1")
+            || auth_url.contains("redirect_uri=https://localhost");
+
+        if uses_localhost_callback {
+            info!("Detected localhost-callback SSO flow");
+            let server_base_url = match url::Url::parse(auth_url) {
+                Ok(u) => format!(
+                    "{}://{}:{}",
+                    u.scheme(),
+                    u.host_str().unwrap_or(""),
+                    u.port().unwrap_or(9000)
+                ),
+                Err(_) => {
+                    self.sso_auth_initiated = false;
+                    return Err(anyhow!("Invalid auth URL: {}", auth_url));
+                }
+            };
+            match oauth::authenticate_sso(auth_url, &server_base_url).await {
+                Ok(()) => {
+                    info!("SSO localhost-callback flow completed");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("SSO localhost-callback flow failed: {}", e);
+                    self.sso_auth_initiated = false;
+                    Err(anyhow!("SSO authentication failed: {}", e))
+                }
             }
-            Err(e) => {
-                error!("SSO authentication failed: {}", e);
-                self.sso_auth_initiated = false;
-                Err(anyhow!("SSO authentication failed: {}", e))
+        } else {
+            info!("Detected native OpenVPN webauth flow (no localhost callback)");
+            // For native OpenVPN webauth, just open the browser. The server
+            // will complete authentication through the VPN tunnel (AUTH_PENDING).
+            match oauth::authenticate(auth_url, None).await {
+                Ok(_) => {
+                    info!("Browser opened for native webauth; waiting for server to complete auth via tunnel");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to open browser for webauth: {}", e);
+                    self.sso_auth_initiated = false;
+                    Err(anyhow!("Browser open failed: {}", e))
+                }
             }
         }
     }
@@ -768,6 +1020,12 @@ impl OpenVpnManager {
         // Clean up socket
         let _ = tokio::fs::remove_file(&self.socket_path).await;
 
+        // Clean up temp config file if we created one
+        if let Some(ref temp_config) = self.temp_config_path {
+            let _ = tokio::fs::remove_file(temp_config).await;
+            self.temp_config_path = None;
+        }
+
         self.event_tx
             .send(VpnEvent::State(VpnState::Stopped))
             .await
@@ -793,7 +1051,9 @@ impl OpenVpnManager {
     async fn save_credentials_after_connect(&self) {
         info!(
             "save_credentials_after_connect called, auth_token={:?}, pending_auth_url={:?}",
-            self.auth_token.as_ref().map(|t| format!("{}...", &t[..t.len().min(20)])),
+            self.auth_token
+                .as_ref()
+                .map(|t| format!("{}...", &t[..t.len().min(20)])),
             self.pending_auth_url.is_some()
         );
         // Prefer auth_token if we received one from the server
@@ -905,14 +1165,22 @@ fn extract_open_url(message: &str) -> Option<String> {
 /// Extract auth URL from OpenVPN message
 fn extract_auth_url(message: &str) -> Option<String> {
     // Look for common patterns in web-auth messages
-    // Pattern 1: WEB_AUTH::<url>
-    if let Some(start) = message.find("WEB_AUTH::") {
-        let url_start = start + "WEB_AUTH::".len();
-        let url_end = message[url_start..]
-            .find(|c: char| c.is_whitespace())
-            .map(|i| url_start + i)
-            .unwrap_or(message.len());
-        return Some(message[url_start..url_end].to_string());
+    // Pattern 1: WEB_AUTH:flags:url  (e.g. WEB_AUTH:hidden:https://...)
+    // The URL is always the last field after the final colon before http/https.
+    if let Some(start) = message.find("WEB_AUTH:") {
+        let after_prefix = &message[start + "WEB_AUTH:".len()..];
+        // Find the start of the actual URL (http:// or https://)
+        if let Some(url_start_rel) = after_prefix
+            .find("http://")
+            .or_else(|| after_prefix.find("https://"))
+        {
+            let url_start = start + "WEB_AUTH:".len() + url_start_rel;
+            let url_end = message[url_start..]
+                .find(|c: char| c.is_whitespace())
+                .map(|i| url_start + i)
+                .unwrap_or(message.len());
+            return Some(message[url_start..url_end].to_string());
+        }
     }
 
     // Pattern 1b: OPEN_URL:http://... (from AUTH_PENDING state or control message)
@@ -920,9 +1188,8 @@ fn extract_auth_url(message: &str) -> Option<String> {
         return Some(url);
     }
 
-    // Pattern 2: AUTH_PENDING with URL
+    // Pattern 2: fallback - any http/https URL in the message
     if message.contains("http://") || message.contains("https://") {
-        // Try to extract URL
         for word in message.split_whitespace() {
             if word.starts_with("http://") || word.starts_with("https://") {
                 return Some(word.trim_matches(|c| c == '"' || c == '\'').to_string());
@@ -966,5 +1233,9 @@ impl Drop for OpenVpnManager {
         }
         // Clean up socket
         let _ = std::fs::remove_file(&self.socket_path);
+        // Clean up temp config file
+        if let Some(ref temp_config) = self.temp_config_path {
+            let _ = std::fs::remove_file(temp_config);
+        }
     }
 }

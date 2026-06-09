@@ -1,0 +1,7 @@
+[Unit]
+Description=OpenVPN SSO Browser Launcher
+
+[Service]
+Type=oneshot
+KillMode=process
+ExecStart=/bin/sh -c 'for f in /run/nm-openvpn-sso/$(id -u)/*.url; do [ -f "$$f" ] && url="$$(cat "$$f" 2>/dev/null)" && [ -n "$$url" ] && xdg-open "$$url" && rm -f "$$f"; done || true'

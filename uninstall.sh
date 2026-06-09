@@ -19,11 +19,6 @@ fi
 
 PREFIX="${PREFIX:-/usr}"
 LIBDIR="${LIBDIR:-$PREFIX/lib}"
-SYSCONFDIR="${SYSCONFDIR:-/etc}"
-
-info "Stopping service..."
-systemctl stop nm-openvpn-sso.service 2>/dev/null || true
-systemctl disable nm-openvpn-sso.service 2>/dev/null || true
 
 info "Removing files..."
 rm -f "$LIBDIR/nm-openvpn-sso-service"
@@ -32,6 +27,10 @@ rm -f "$PREFIX/share/dbus-1/system.d/org.freedesktop.NetworkManager.openvpn-sso.
 rm -f "$PREFIX/bin/vpn-sso-connect"
 rm -f "$PREFIX/share/applications/vpn-sso-connect.desktop"
 rm -f "$LIBDIR/qt6/plugins/plasma/network/vpn/plasmanetworkmanagement_openvpnssoui.so"
+rm -f "$LIBDIR/systemd/user/openvpn-sso-browser.path"
+rm -f "$LIBDIR/systemd/user/openvpn-sso-browser.service"
+rm -f "$LIBDIR/systemd/user/default.target.wants/openvpn-sso-browser.path"
+rm -rf /run/nm-openvpn-sso/
 
 info "Reloading daemons..."
 systemctl daemon-reload

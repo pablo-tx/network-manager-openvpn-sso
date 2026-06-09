@@ -137,13 +137,27 @@ jobs:
             openssl-devel \
             pkg-config \
             rpm-build \
-            gcc
+            gcc \
+            cmake \
+            extra-cmake-modules \
+            qt6-qtbase-devel \
+            kf6-kcoreaddons-devel \
+            kf6-ki18n-devel \
+            kf6-kio-devel \
+            kf6-networkmanager-qt-devel \
+            NetworkManager-libnm-devel \
+            plasma-nm
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm
 
       - name: Build release binary
         run: cargo build --release
+
+      - name: Build plasma-nm plugin
+        run: |
+          cmake -B plasma-nm-plugin/build -S plasma-nm-plugin
+          cmake --build plasma-nm-plugin/build
 
       - name: Strip binary
         run: strip target/release/nm-openvpn-sso-service

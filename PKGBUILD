@@ -1,7 +1,7 @@
 # Maintainer: Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>
 pkgname=networkmanager-openvpn-sso
-pkgver=0.2.0
-pkgrel=2
+pkgver=0.3.3
+pkgrel=1
 pkgdesc="NetworkManager VPN plugin for OpenVPN with SSO/OAuth authentication"
 arch=('x86_64')
 url="https://github.com/pegasusheavy/network-manager-openvpn-sso"
@@ -18,7 +18,7 @@ build() {
     cd "$startdir"
     cargo build --release --locked
 
-    # Build plasma-nm plugin if plasma-nm and KDE dependencies are available
+    # Build plasma-nm plugin if KDE dependencies are available
     if pkg-config --exists "KF6NetworkManagerQt" && [[ -f /usr/lib/libplasmanm_editor.so ]]; then
         cmake -B plasma-nm-plugin/build -S plasma-nm-plugin
         cmake --build plasma-nm-plugin/build
@@ -28,7 +28,7 @@ build() {
 package() {
     cd "$startdir"
 
-    # Install binary (same location pattern as nm-openvpn-service)
+    # Install binary
     install -Dm755 "target/release/nm-openvpn-sso-service" \
         "$pkgdir/usr/lib/nm-openvpn-sso-service"
 
@@ -36,17 +36,23 @@ package() {
     install -Dm644 "data/nm-openvpn-sso-service.name" \
         "$pkgdir/usr/lib/NetworkManager/VPN/nm-openvpn-sso-service.name"
 
-    # Install D-Bus policy (allows root to own the bus name)
+    # Install D-Bus policy
     install -Dm644 "data/org.freedesktop.NetworkManager.openvpn-sso.conf" \
         "$pkgdir/usr/share/dbus-1/system.d/nm-openvpn-sso-service.conf"
 
-    # Install helper script for KDE/CLI users
+    # Install helper script
     install -Dm755 "data/vpn-sso-connect.sh" \
         "$pkgdir/usr/bin/vpn-sso-connect"
 
     # Install desktop entry
     install -Dm644 "data/vpn-sso-connect.desktop" \
         "$pkgdir/usr/share/applications/vpn-sso-connect.desktop"
+
+    # Install systemd user units for browser launch (SELinux-compatible IPC)
+    install -Dm644 "data/openvpn-sso-browser.path" \
+        "$pkgdir/usr/lib/systemd/user/openvpn-sso-browser.path"
+    install -Dm644 "data/openvpn-sso-browser.service" \
+        "$pkgdir/usr/lib/systemd/user/openvpn-sso-browser.service"
 
     # Install plasma-nm plugin if built
     if [[ -f "plasma-nm-plugin/build/plasmanetworkmanagement_openvpnssoui.so" ]]; then

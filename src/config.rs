@@ -50,6 +50,16 @@ pub struct ConnectionConfig {
     pub remote_cert_tls: Option<String>,
     /// Connection type: tls, password, etc. (from vpn.data "connection-type")
     pub connection_type: Option<String>,
+    /// TLS crypt key path (from vpn.data "tls-crypt")
+    pub tls_crypt: Option<String>,
+    /// TLS crypt V2 key path (from vpn.data "tls-crypt-v2")
+    pub tls_crypt_v2: Option<String>,
+    /// Minimum TLS version (from vpn.data "tls-version-min")
+    pub tls_version_min: Option<String>,
+    /// Verify x509 name (from vpn.data "verify-x509-name")
+    pub verify_x509_name: Option<String>,
+    /// Challenge response flags (from vpn.data "challenge-response-flags")
+    pub challenge_response_flags: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -87,6 +97,11 @@ impl ConnectionConfig {
         let dev = vpn_data.get("dev").cloned();
         let remote_cert_tls = vpn_data.get("remote-cert-tls").cloned();
         let connection_type = vpn_data.get("connection-type").cloned();
+        let tls_crypt = vpn_data.get("tls-crypt").cloned();
+        let tls_crypt_v2 = vpn_data.get("tls-crypt-v2").cloned();
+        let tls_version_min = vpn_data.get("tls-version-min").cloned();
+        let verify_x509_name = vpn_data.get("verify-x509-name").cloned();
+        let challenge_response_flags = vpn_data.get("challenge-response-flags").cloned();
 
         // Validate: need either a config file or at least a CA cert
         if config_path.is_none() && ca.is_none() {
@@ -124,6 +139,11 @@ impl ConnectionConfig {
             dev,
             remote_cert_tls,
             connection_type,
+            tls_crypt,
+            tls_crypt_v2,
+            tls_version_min,
+            verify_x509_name,
+            challenge_response_flags,
         })
     }
 
@@ -175,7 +195,52 @@ impl ConnectionConfig {
             if let Some(ref remote_cert_tls) = self.remote_cert_tls {
                 args.extend(["--remote-cert-tls".to_string(), remote_cert_tls.clone()]);
             }
+            if let Some(ref tls_crypt) = self.tls_crypt {
+                args.extend(["--tls-crypt".to_string(), tls_crypt.clone()]);
+            }
+            if let Some(ref tls_crypt_v2) = self.tls_crypt_v2 {
+                args.extend(["--tls-crypt-v2".to_string(), tls_crypt_v2.clone()]);
+            }
+            if let Some(ref tls_version_min) = self.tls_version_min {
+                args.extend(["--tls-version-min".to_string(), tls_version_min.clone()]);
+            }
+            if let Some(ref verify_x509_name) = self.verify_x509_name {
+                // verify-x509-name can be "name:value" or just "value" with a type
+                // NetworkManager stores it as a single string like "name:server_F6GFnpl7jNfqyFuq"
+                if let Some((arg_type, name)) = verify_x509_name.split_once(':') {
+                    args.extend([
+                        "--verify-x509-name".to_string(),
+                        name.to_string(),
+                        arg_type.to_string(),
+                    ]);
+                } else {
+                    args.extend(["--verify-x509-name".to_string(), verify_x509_name.clone()]);
+                }
+            }
+            if let Some(ref challenge_response_flags) = self.challenge_response_flags {
+                // challenge-response-flags=2 means use static challenge
+                if challenge_response_flags == "2" {
+                    args.extend([
+                        "--static-challenge".to_string(),
+                        "Authentication required".to_string(),
+                        "0".to_string(),
+                    ]);
+                }
+            }
         }
+
+        // Announce SSO/webauth capability so the server knows to send AUTH_PENDING
+        // with OPEN_URL instead of rejecting with empty credentials.
+        args.extend([
+            "--setenv".to_string(),
+            "IV_SSO".to_string(),
+            "webauth,openurl".to_string(),
+        ]);
+
+        // Prevent OpenVPN from auto-sending empty credentials before the
+        // management interface can respond. With --management-query-passwords,
+        // OpenVPN will query the management interface for credentials.
+        args.push("--auth-user-pass".to_string());
 
         // Common: management interface
         args.extend([
