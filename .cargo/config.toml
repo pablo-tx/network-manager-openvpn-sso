@@ -1,0 +1,8 @@
+# Use GNU ld (bfd) instead of lld for linking.
+#
+# ring v0.17.14 contains assembly object files that ld.lld cannot
+# link correctly. ld.bfd has no such issue and is the default linker
+# on Fedora/RHEL. On Arch Linux where the Rust toolchain defaults to
+# lld, this ensures consistent linking.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]

@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
 use zbus::zvariant::OwnedValue;
 use zbus::{interface, Connection};
@@ -47,9 +47,12 @@ enum NMVpnPluginFailure {
 
 /// Shared plugin state
 pub struct PluginState {
-    pub vpn_manager: Option<OpenVpnManager>,
+    pub vpn_manager: Option<Arc<Mutex<OpenVpnManager>>>,
     pub current_config: Option<ConnectionConfig>,
     pub state: NMVpnServiceState,
+    /// Stop signal for the current connection — triggered by disconnect()
+    /// to break the management loop without needing to lock the manager mutex.
+    pub stop_signal: Option<Arc<Notify>>,
 }
 
 impl Default for PluginState {
@@ -58,6 +61,7 @@ impl Default for PluginState {
             vpn_manager: None,
             current_config: None,
             state: NMVpnServiceState::Init,
+            stop_signal: None,
         }
     }
 }
@@ -94,51 +98,43 @@ impl VpnPlugin {
             *rx_guard = Some(rx);
         }
 
-        // Create and store VPN manager
-        let vpn_manager = OpenVpnManager::new(config.clone(), tx);
+        // Create and store VPN manager (shared via Arc<Mutex>)
+        let vpn_manager = Arc::new(Mutex::new(OpenVpnManager::new(config.clone(), tx)));
+
+        // Extract the stop signal so disconnect() can trigger it without locking
+        let stop = vpn_manager.lock().await.stop.clone();
 
         // Update state
         {
             let mut state = self.inner_state.write().await;
             state.current_config = Some(config.clone());
             state.state = NMVpnServiceState::Starting;
-            state.vpn_manager = Some(vpn_manager);
+            state.vpn_manager = Some(vpn_manager.clone());
+            state.stop_signal = Some(stop);
         }
 
+        // Clone state for the background tasks
+        let connect_state = self.inner_state.clone();
+        let emitter_state = self.inner_state.clone();
+        let event_rx_clone = self.event_rx.clone();
+        let conn_clone = self.connection.clone();
+
         // Start connection in background
-        let state_clone = self.inner_state.clone();
-
         tokio::spawn(async move {
-            // Take manager temporarily to run connect
-            let mut manager = {
-                let mut state = state_clone.write().await;
-                state.vpn_manager.take()
-            };
-
-            if let Some(ref mut mgr) = manager {
-                match mgr.connect().await {
-                    Ok(()) => {
-                        info!("VPN connection established");
-                    }
-                    Err(e) => {
-                        error!("VPN connection failed: {}", e);
-                        let mut state = state_clone.write().await;
-                        state.state = NMVpnServiceState::Stopped;
-                    }
+            let mut mgr = vpn_manager.lock().await;
+            match mgr.connect().await {
+                Ok(()) => {
+                    info!("VPN connection established");
                 }
-            }
-
-            // Store manager back
-            {
-                let mut state = state_clone.write().await;
-                state.vpn_manager = manager;
+                Err(e) => {
+                    error!("VPN connection failed: {}", e);
+                    let mut state = connect_state.write().await;
+                    state.state = NMVpnServiceState::Stopped;
+                }
             }
         });
 
         // Start event processing
-        let emitter_state = self.inner_state.clone();
-        let event_rx_clone = self.event_rx.clone();
-        let conn_clone = self.connection.clone();
 
         tokio::spawn(async move {
             // Get connection for signal emission
@@ -215,13 +211,24 @@ impl VpnPlugin {
         let mut state = self.inner_state.write().await;
         state.state = NMVpnServiceState::Stopping;
 
-        if let Some(ref mut manager) = state.vpn_manager {
-            if let Err(e) = manager.disconnect().await {
+        // Signal the management loop to stop WITHOUT locking the manager mutex.
+        // This avoids a deadlock where the management loop holds the lock
+        // while blocking on reader.read_line().
+        if let Some(stop) = state.stop_signal.take() {
+            info!("Signaling management loop to stop");
+            stop.notify_one();
+            // Brief yield to let the management loop process the signal and
+            // release the mutex
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        if let Some(manager) = state.vpn_manager.take() {
+            let mut mgr = manager.lock().await;
+            if let Err(e) = mgr.disconnect().await {
                 warn!("Error during disconnect: {}", e);
             }
         }
 
-        state.vpn_manager = None;
         state.current_config = None;
         state.state = NMVpnServiceState::Stopped;
 
