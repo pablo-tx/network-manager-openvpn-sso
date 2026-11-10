@@ -27,9 +27,6 @@ axum = "0.8"
 # HTTP client for forwarding OAuth code to VPN server
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Secrets/keyring
-secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -47,7 +44,6 @@ url = "2"
 
 # Utilities
 libc = "0.2"
-notify-rust = "4"
 
 [profile.release]
 lto = true

@@ -1,37 +1,37 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Joseph R. Quinn
 
-//! Secure token storage using the system keyring (libsecret/Secret Service)
-//! with fallback to encrypted file storage when keyring is unavailable
-//! (e.g., when running as root in NetworkManager plugin)
+//! Cache of server auth-tokens, so a new connection can skip the browser
+//! while the last token is still valid.
+//!
+//! The plugin runs as root under NetworkManager, outside any user session,
+//! so the user's keyring is out of reach. Tokens are kept in root-only files
+//! under /var/lib/nm-openvpn-sso.
+
+use std::fs::{OpenOptions, Permissions};
+use std::io::{ErrorKind, Write as _};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use secret_service::{EncryptionType, SecretService};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-const COLLECTION_LABEL: &str = "nm-openvpn-sso";
-const ATTRIBUTE_CONNECTION: &str = "connection-uuid";
-const ATTRIBUTE_TYPE: &str = "token-type";
-
-/// Directory for file-based credential cache (fallback when keyring unavailable)
+/// Root-only directory holding one `<connection-uuid>.json` per connection
 const CACHE_DIR: &str = "/var/lib/nm-openvpn-sso";
 
-/// Stored OAuth tokens for a connection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A cached auth-token. Files written by earlier versions carry an unused
+/// `refresh_token` field, which is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTokens {
-    /// OAuth access token
+    /// Server auth-token
     pub access_token: String,
-    /// OAuth refresh token (if provided)
-    pub refresh_token: Option<String>,
-    /// Token expiry timestamp (Unix epoch seconds)
+    /// Expiry (Unix epoch seconds)
     pub expires_at: Option<i64>,
 }
 
 impl StoredTokens {
-    /// Check if the access token is still valid (with 60s buffer)
+    /// Still valid for at least another minute
     pub fn is_valid(&self) -> bool {
         match self.expires_at {
             Some(expires) => {
@@ -41,286 +41,104 @@ impl StoredTokens {
                     .unwrap_or(0);
                 expires > now + 60
             }
-            None => true, // No expiry info, assume valid
+            None => true,
         }
-    }
-
-    /// Check if we can attempt a refresh
-    pub fn can_refresh(&self) -> bool {
-        self.refresh_token.is_some()
     }
 }
 
-/// Keyring-based secret storage
-pub struct SecretStore {
-    service: SecretService<'static>,
+fn cache_file(connection_uuid: &str) -> PathBuf {
+    PathBuf::from(CACHE_DIR).join(format!("{connection_uuid}.json"))
 }
 
-impl SecretStore {
-    /// Connect to the Secret Service
-    pub async fn new() -> Result<Self> {
-        let service = SecretService::connect(EncryptionType::Dh)
-            .await
-            .context("Failed to connect to Secret Service")?;
-
-        Ok(Self { service })
-    }
-
-    /// Store tokens for a connection
-    pub async fn store_tokens(&self, connection_uuid: &str, tokens: &StoredTokens) -> Result<()> {
-        let collection = self
-            .service
-            .get_default_collection()
-            .await
-            .context("Failed to get default keyring collection")?;
-
-        // Unlock if necessary
-        if collection.is_locked().await? {
-            collection.unlock().await?;
-        }
-
-        let attributes: HashMap<&str, &str> = [
-            (ATTRIBUTE_CONNECTION, connection_uuid),
-            (ATTRIBUTE_TYPE, "oauth"),
-        ]
-        .into_iter()
-        .collect();
-
-        let secret = serde_json::to_string(tokens)?;
-        let label = format!("{} - {}", COLLECTION_LABEL, connection_uuid);
-
-        // Delete existing item first (if any)
-        self.delete_tokens(connection_uuid).await.ok();
-
-        collection
-            .create_item(
-                &label,
-                attributes,
-                secret.as_bytes(),
-                true, // replace
-                "text/plain",
-            )
-            .await
-            .context("Failed to store tokens in keyring")?;
-
-        debug!("Stored tokens for connection {}", connection_uuid);
-        Ok(())
-    }
-
-    /// Retrieve tokens for a connection
-    pub async fn get_tokens(&self, connection_uuid: &str) -> Result<Option<StoredTokens>> {
-        let collection = self
-            .service
-            .get_default_collection()
-            .await
-            .context("Failed to get default keyring collection")?;
-
-        // Unlock if necessary
-        if collection.is_locked().await? {
-            collection.unlock().await?;
-        }
-
-        let attributes: HashMap<&str, &str> = [
-            (ATTRIBUTE_CONNECTION, connection_uuid),
-            (ATTRIBUTE_TYPE, "oauth"),
-        ]
-        .into_iter()
-        .collect();
-
-        let items = collection.search_items(attributes).await?;
-
-        if let Some(item) = items.into_iter().next() {
-            if item.is_locked().await? {
-                item.unlock().await?;
-            }
-
-            let secret = item.get_secret().await?;
-            let tokens: StoredTokens = serde_json::from_slice(&secret)?;
-
-            debug!("Retrieved tokens for connection {}", connection_uuid);
-            return Ok(Some(tokens));
-        }
-
-        Ok(None)
-    }
-
-    /// Delete tokens for a connection
-    #[allow(dead_code)]
-    pub async fn delete_tokens(&self, connection_uuid: &str) -> Result<()> {
-        let collection = self
-            .service
-            .get_default_collection()
-            .await
-            .context("Failed to get default keyring collection")?;
-
-        let attributes: HashMap<&str, &str> = [
-            (ATTRIBUTE_CONNECTION, connection_uuid),
-            (ATTRIBUTE_TYPE, "oauth"),
-        ]
-        .into_iter()
-        .collect();
-
-        let items = collection.search_items(attributes).await?;
-
-        for item in items {
-            item.delete().await?;
-        }
-
-        debug!("Deleted tokens for connection {}", connection_uuid);
-        Ok(())
-    }
-}
-
-/// Get cached tokens if valid, otherwise None
+/// The cached token for a connection, if there is one and it has not expired
 pub async fn get_cached_credentials(connection_uuid: &str) -> Option<StoredTokens> {
-    // Try keyring first
-    match SecretStore::new().await {
-        Ok(store) => match store.get_tokens(connection_uuid).await {
-            Ok(Some(tokens)) if tokens.is_valid() => {
-                debug!("Using cached valid tokens from keyring");
-                return Some(tokens);
-            }
-            Ok(Some(tokens)) if tokens.can_refresh() => {
-                debug!("Cached tokens expired but refresh available (keyring)");
-                return Some(tokens);
-            }
-            Ok(_) => {
-                debug!("No valid cached tokens in keyring");
-            }
-            Err(e) => {
-                debug!("Failed to retrieve cached tokens from keyring: {}", e);
-            }
-        },
+    let path = cache_file(connection_uuid);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => return None,
         Err(e) => {
-            debug!("Failed to connect to secret service: {}", e);
+            warn!("Failed to read token cache {}: {e}", path.display());
+            return None;
         }
-    }
-
-    // Fallback to file-based cache
-    match get_file_cached_credentials(connection_uuid).await {
-        Ok(Some(tokens)) if tokens.is_valid() => {
-            debug!("Using cached valid tokens from file");
-            Some(tokens)
-        }
-        Ok(Some(tokens)) if tokens.can_refresh() => {
-            debug!("Cached tokens expired but refresh available (file)");
-            Some(tokens)
-        }
+    };
+    match serde_json::from_str::<StoredTokens>(&content) {
+        Ok(tokens) if tokens.is_valid() => Some(tokens),
         Ok(_) => {
-            debug!("No valid cached tokens in file");
+            debug!("Cached auth-token for {connection_uuid} has expired");
             None
         }
         Err(e) => {
-            debug!("Failed to retrieve cached tokens from file: {}", e);
+            warn!("Ignoring unreadable token cache {}: {e}", path.display());
             None
         }
     }
 }
 
-/// Clear cached credentials (called when they are rejected by the server)
+/// Forget the cached token (the server rejected it)
 pub async fn clear_cached_credentials(connection_uuid: &str) {
-    // Clear keyring
-    if let Ok(store) = SecretStore::new().await {
-        if let Err(e) = store.delete_tokens(connection_uuid).await {
-            debug!("Failed to delete keyring tokens: {}", e);
-        }
+    match tokio::fs::remove_file(cache_file(connection_uuid)).await {
+        Ok(()) => info!("Cleared cached auth-token for connection {connection_uuid}"),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => warn!("Failed to clear cached auth-token: {e}"),
     }
-    // Clear file cache
-    let cache_file = get_cache_file_path(connection_uuid);
-    if let Err(e) = tokio::fs::remove_file(&cache_file).await {
-        debug!("Failed to delete file cache: {}", e);
-    }
-    info!(
-        "Cleared cached credentials for connection {}",
-        connection_uuid
-    );
 }
 
-/// Store credentials after successful auth
+/// Cache a token after the server issued it
 pub async fn cache_credentials(connection_uuid: &str, tokens: StoredTokens) -> Result<()> {
-    // Try keyring first
-    match SecretStore::new().await {
-        Ok(store) => match store.store_tokens(connection_uuid, &tokens).await {
-            Ok(()) => {
-                info!("Stored credentials in keyring");
-                return Ok(());
-            }
-            Err(e) => {
-                debug!("Failed to store in keyring: {}, falling back to file", e);
-            }
-        },
-        Err(e) => {
-            debug!(
-                "Failed to connect to secret service: {}, falling back to file",
-                e
-            );
-        }
-    }
-
-    // Fallback to file-based cache
-    store_file_cached_credentials(connection_uuid, &tokens).await
-}
-
-/// Get the cache file path for a connection
-fn get_cache_file_path(connection_uuid: &str) -> PathBuf {
-    PathBuf::from(CACHE_DIR).join(format!("{}.json", connection_uuid))
-}
-
-/// Store credentials in a file (fallback when keyring unavailable)
-async fn store_file_cached_credentials(connection_uuid: &str, tokens: &StoredTokens) -> Result<()> {
-    let cache_dir = PathBuf::from(CACHE_DIR);
-
-    // Create cache directory if it doesn't exist
-    if !cache_dir.exists() {
-        tokio::fs::create_dir_all(&cache_dir)
-            .await
-            .context("Failed to create cache directory")?;
-        // Set restrictive permissions on directory
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&cache_dir, perms)?;
-        }
-    }
-
-    let cache_file = get_cache_file_path(connection_uuid);
-    let json = serde_json::to_string_pretty(tokens)?;
-
-    tokio::fs::write(&cache_file, json.as_bytes())
-        .await
-        .context("Failed to write cache file")?;
-
-    // Set restrictive permissions on file
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&cache_file, perms)?;
-    }
-
-    info!("Stored credentials in file cache: {}", cache_file.display());
+    let json = serde_json::to_vec(&tokens)?;
+    write_private(
+        Path::new(CACHE_DIR),
+        &format!("{connection_uuid}.json"),
+        &json,
+    )
+    .context("Failed to write token cache")?;
+    info!("Cached auth-token for connection {connection_uuid}");
     Ok(())
 }
 
-/// Retrieve credentials from file cache
-async fn get_file_cached_credentials(connection_uuid: &str) -> Result<Option<StoredTokens>> {
-    let cache_file = get_cache_file_path(connection_uuid);
+/// Replace `dir/name` atomically with a root-only file. The token is never
+/// readable by others, not even briefly, and never half-written.
+fn write_private(dir: &Path, name: &str, contents: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, Permissions::from_mode(0o700))?;
+    let temp = dir.join(format!(".{name}.tmp"));
+    let _ = std::fs::remove_file(&temp);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(contents)?;
+    drop(file);
+    std::fs::rename(&temp, dir.join(name))
+}
 
-    if !cache_file.exists() {
-        return Ok(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn reads_caches_from_earlier_versions() {
+        let old = r#"{"access_token":"SESS_ID_AT_x","refresh_token":null,"expires_at":1}"#;
+        let tokens: StoredTokens = serde_json::from_str(old).unwrap();
+        assert_eq!(tokens.access_token, "SESS_ID_AT_x");
+        assert!(!tokens.is_valid());
     }
 
-    let content = tokio::fs::read_to_string(&cache_file)
-        .await
-        .context("Failed to read cache file")?;
+    #[test]
+    fn writes_cache_files_privately() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("secrets-test-{}", std::process::id()));
+        write_private(&dir, "a.json", b"one").unwrap();
+        write_private(&dir, "a.json", b"two").unwrap();
 
-    let tokens: StoredTokens =
-        serde_json::from_str(&content).context("Failed to parse cached credentials")?;
-
-    debug!(
-        "Retrieved credentials from file cache: {}",
-        cache_file.display()
-    );
-    Ok(Some(tokens))
+        let path = dir.join("a.json");
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert!(!dir.join(".a.json.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

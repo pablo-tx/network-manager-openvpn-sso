@@ -416,7 +416,6 @@ impl OpenVpnManager {
         let cached_token = if self.config.uses_credentials() {
             secrets::get_cached_credentials(&self.config.uuid)
                 .await
-                .filter(|tokens| tokens.is_valid())
                 .map(|tokens| tokens.access_token)
         } else {
             None
@@ -722,7 +721,6 @@ async fn cache_token(connection_uuid: &str, token: String) {
         .unwrap_or(0);
     let tokens = secrets::StoredTokens {
         access_token: token,
-        refresh_token: None,
         expires_at: Some(now + CACHED_TOKEN_TTL_SECS),
     };
     if let Err(e) = secrets::cache_credentials(connection_uuid, tokens).await {

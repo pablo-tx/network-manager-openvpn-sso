@@ -10,7 +10,6 @@ use axum::{
     routing::get,
     Router,
 };
-use notify_rust::Notification;
 use serde::Deserialize;
 use std::os::unix::fs::{chown, PermissionsExt};
 use std::path::Path;
@@ -37,16 +36,8 @@ pub async fn authenticate(auth_url: &str) -> Result<()> {
 
     if browser_opened {
         info!("Browser opened successfully");
-        show_notification(
-            "VPN Authentication",
-            "Please complete login in your browser...",
-        );
     } else {
         warn!("Could not open browser automatically");
-        show_notification(
-            "VPN SSO Login Required",
-            &format!("Please open: {}", auth_url),
-        );
     }
 
     info!("SSO Login URL: {}", auth_url);
@@ -152,16 +143,8 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
 
     if browser_opened {
         info!("Browser opened for SSO authentication");
-        show_notification(
-            "VPN Authentication",
-            "Please complete login in your browser...",
-        );
     } else {
         warn!("Could not open browser automatically");
-        show_notification(
-            "VPN SSO Login Required",
-            &format!("Please open: {}", auth_url),
-        );
     }
 
     info!("SSO Login URL: {}", auth_url);
@@ -193,7 +176,6 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
 
     if response.status().is_success() {
         info!("VPN server accepted OAuth authentication");
-        show_notification("VPN Authentication", "Login successful! VPN connecting...");
     } else {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -514,26 +496,6 @@ fn get_uid_for_user(username: &str) -> Option<u32> {
         .ok()?;
 
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
-/// Show a desktop notification (non-blocking wrapper)
-fn show_notification(summary: &str, body: &str) {
-    let summary = summary.to_string();
-    let body = body.to_string();
-
-    // Spawn in background thread to avoid blocking
-    std::thread::spawn(move || {
-        if let Err(e) = Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .appname("OpenVPN SSO")
-            .timeout(5000)
-            .show()
-        {
-            // Can't use warn! here as it might not be set up for this thread
-            eprintln!("Failed to show notification: {}", e);
-        }
-    });
 }
 
 /// HTML page for auth errors
