@@ -4,17 +4,19 @@ A NetworkManager VPN plugin that adds OAuth 2.0 / OIDC Single Sign-On (SSO) supp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This is a fork focused on SELinux compatibility, reliable browser launch via systemd path activation, and proper VPN teardown.
+This is a fork focused on SELinux compatibility, reliable browser launch via systemd path activation, automatic reconnection, and running untrusted `.ovpn` files safely.
 
 ## Fork Features
 
 - **SELinux-safe browser launch** — Instead of launching the browser directly from `NetworkManager_t` context (which is blocked by SELinux from accessing user session D-Bus), the plugin writes the SSO URL to `/run/nm-openvpn-sso/$UID/` and triggers a **systemd user path unit** that opens the browser as the logged-in user.
 - **systemd path activation** — No continuous watcher daemons. Uses kernel inotify via `systemd.path(5)` to detect new URL files and launch the browser via `xdg-open`. The service exits after processing and the path unit reactivates on new files.
 - **Works with Flatpak browsers** — Since the browser is launched from the user's systemd session (not from `NetworkManager_t`), `xdg-open` resolves Flatpak-installed browsers correctly.
-- **Proper VPN teardown** — `OpenVpnManager` is shared via `Arc<Mutex<>>` so `disconnect()` actually kills the OpenVPN process, cleaning up the TUN device and routes.
+- **Automatic reconnection** — When OpenVPN restarts the tunnel (network change, ping timeout, rejected auth-token), the plugin re-authenticates and NetworkManager keeps the connection up. See [Reconnect Flow](#reconnect-flow).
+- **Proper VPN teardown** — Disconnecting stops OpenVPN and waits for it to exit, so the TUN device and routes are cleaned up.
 - **Smart SSO flow detection** — Automatically detects native OpenVPN webauth (`AUTH_PENDING` without localhost callback) vs callback flow (URL contains `redirect_uri=127.0.0.1`). Handles both gracefully.
-- **Config file sanitization** — Removes `management` directives from imported `.ovpn` files before passing them to OpenVPN, preventing conflicts with the plugin's management interface.
-- **No session token caching** — Every connection triggers the SSO browser flow. No stale token edge cases.
+- **Safe `.ovpn` handling** — Files not controlled by root run without scripts, plugins or file writes. See [Config File Trust](#config-file-trust).
+- **Session token cache** — The server's auth-token is cached root-only in `/var/lib/nm-openvpn-sso/` for up to 24 hours, so a reconnect does not always need the browser. A rejected token is discarded.
+- **IPv4 and IPv6 VPN servers**
 - **Full NetworkManager integration** — Works with `nmcli`, GNOME Settings, and KDE Plasma (via plasma-nm UI plugin).
 
 ## Installation
@@ -111,14 +113,14 @@ sudo ./install.sh
 This fork is designed to work on Fedora with SELinux enforcing.
 
 **The problem:** When NetworkManager spawns the VPN plugin, it runs as `NetworkManager_t`. This context:
-- Cannot connect to the user's D-Bus session (required for `xdg-open`, `kdialog`, `notify-rust`)
+- Cannot connect to the user's D-Bus session (required for `xdg-open`, `kdialog` and desktop notifications)
 - Cannot write to `/run/user/$UID/` (which is `user_tmp_t`)
 - Cannot execute `runuser` or `machinectl` to escape its context
 
 **The solution:**
 1. The plugin creates `/run/nm-openvpn-sso/$UID/` (type `NetworkManager_var_run_t` — writable by `NetworkManager_t`)
 2. Writes the SSO URL to `sso-{pid}.url`
-3. Chowns the directory to the user so the user's systemd service can delete files
+3. Grants the user access to the directory with a POSIX ACL (NetworkManager's service has no `CAP_CHOWN`), so the user's systemd service can delete files and other users cannot touch them
 4. The systemd user path unit detects the file and launches `xdg-open` from `unconfined_t` (user domain), which has full access to user D-Bus and `NetworkManager_var_run_t`
 
 ## Troubleshooting
@@ -158,14 +160,20 @@ Verify routes are correctly applied after disconnect:
 ip route | grep tun
 ```
 
-If TUN devices persist after disconnect, the OpenVPN process wasn't properly killed. Check logs for:
+If TUN devices persist after disconnect, OpenVPN did not exit. Check the logs
+for `OpenVPN exited` or `OpenVPN did not exit within 5s, killing it`.
 
-```
-Disconnect called
-Stopping OpenVPN process
-```
+### Connection refused with "Refusing OpenVPN config"
 
-If "Stopping OpenVPN process" is missing, the `OpenVpnManager` was inaccessible (Arc<Mutex> race). This is fixed in the current version.
+The `.ovpn` file is not owned by root and references something the plugin
+cannot make safe: a key file its owner cannot read, or a proxy credentials
+file. See [Config File Trust](#config-file-trust).
+
+### KDE Plasma shows "missing support" message
+
+The plasma-nm UI plugin is not installed. Rebuild with the KDE dependencies
+available (see [Building from Source](#building-from-source)). The VPN still
+works without it; use `nmcli` or `nm-connection-editor` to connect.
 
 ### Connection times out
 
@@ -221,12 +229,40 @@ connection stays up in NetworkManager while OpenVPN re-establishes it:
 If three SSO attempts in a row fail (for example, nobody completes the login),
 the plugin stops and NetworkManager marks the connection as failed.
 
+### Config File Trust
+
+OpenVPN runs as root, and NetworkManager lets any local user point a
+connection at any `.ovpn` file. The plugin therefore treats files
+differently depending on who controls them:
+
+- **Owned by root, writable only by root, in directories only root can
+  change** (for example `/etc/openvpn/client/`): used as is. Relative paths
+  resolve next to the file, and the file's own `script-security`, `up`,
+  `down` and similar directives apply.
+- **Anything else** (for example a file in `~/Downloads`): read once and
+  rewritten into a root-only copy in `/run/nm-openvpn-sso/`. Directives
+  that run programs, load plugins or write files (`up`, `down`, `plugin`,
+  `script-security`, `log`, `status`, ...) are dropped with a warning in the
+  log. Key and certificate files it references must be readable by the
+  file's owner and are inlined. OpenVPN runs with `--script-security 1`.
+
+To use scripts (for example a DNS update script), install the file as root:
+
+```bash
+sudo install -m 600 -o root -g root your-vpn.ovpn /etc/openvpn/client/
+nmcli connection modify "your-vpn-name" +vpn.data config=/etc/openvpn/client/your-vpn.ovpn
+```
+
+The plugin itself no longer passes `--script-security 2`; a root-owned file
+that needs scripts must say `script-security 2` itself, as it would for a
+plain `openvpn --config`.
+
 ### Disconnect Flow
 
 1. User clicks disconnect in NetworkManager
 2. The plugin sends `signal SIGTERM` to OpenVPN via the management interface
 3. OpenVPN shuts down gracefully, cleaning up the TUN device and routes
-4. The plugin cleans up the management socket and temporary config file
+4. The plugin cleans up the management socket and the config copy, if one was made
 
 ## Building from Source
 
@@ -259,6 +295,19 @@ cargo build --release
 ```bash
 sudo ./install.sh
 ```
+
+### Build an RPM
+
+```bash
+cargo install cargo-generate-rpm
+cargo build --release
+cmake -B plasma-nm-plugin/build -S plasma-nm-plugin && cmake --build plasma-nm-plugin/build
+cargo generate-rpm --auto-req packaging/rpm-find-requires.sh
+```
+
+`--auto-req` limits the package's requirements to libraries the binaries
+link directly; the default ldd-based list includes libraries that some
+systems (for example rpm-ostree based ones) cannot provide.
 
 ### Uninstall
 

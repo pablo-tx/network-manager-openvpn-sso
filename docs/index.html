@@ -94,7 +94,7 @@
             "Browser-based SSO login",
             "Automatic OAuth configuration discovery",
             "Session token caching",
-            "Desktop notifications",
+            "Automatic reconnection",
             "Full NetworkManager integration"
         ]
     }
@@ -296,11 +296,11 @@
                 <!-- Feature 4 -->
                 <article class="feature-card glass rounded-2xl p-6 transition-all duration-300">
                     <div class="w-14 h-14 bg-green-500/20 rounded-xl flex items-center justify-center mb-4">
-                        <i class="fa-solid fa-bell text-green-500 text-2xl"></i>
+                        <i class="fa-solid fa-rotate text-green-500 text-2xl"></i>
                     </div>
-                    <h3 class="text-xl font-semibold mb-2">Desktop Notifications</h3>
+                    <h3 class="text-xl font-semibold mb-2">Automatic Reconnection</h3>
                     <p class="text-gray-400">
-                        Receive real-time notifications about connection status, authentication requests, and errors.
+                        Re-authenticates and restores the tunnel when OpenVPN restarts it, without NetworkManager dropping the connection.
                     </p>
                 </article>
                 

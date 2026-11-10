@@ -14,7 +14,7 @@ NetworkManager OpenVPN SSO enables browser-based SSO authentication for OpenVPN 
 - Browser-based SSO authentication via OAuth 2.0 / OIDC
 - Automatic OAuth discovery from the OpenVPN server
 - Session token caching for connection maintenance
-- Desktop notifications for connection status
+- Automatic re-authentication and reconnection when OpenVPN restarts the tunnel
 - Full NetworkManager integration (GNOME and KDE Plasma network applets)
 - Native KDE Plasma plasma-nm UI plugin
 - Packages for Arch Linux, Debian/Ubuntu, Fedora/RHEL, and generic Linux tarballs
