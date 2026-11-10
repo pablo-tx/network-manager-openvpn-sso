@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #include "openvpnssoauth.h"
 
@@ -12,6 +12,7 @@ OpenVpnSsoAuthWidget::OpenVpnSsoAuthWidget(const NetworkManager::VpnSetting::Ptr
                                             QWidget *parent)
     : SettingWidget(setting, hints, parent)
 {
+    // hints intentionally unused; browser-based SSO requires no NetworkManager secrets
     auto *layout = new QVBoxLayout(this);
 
     auto *label = new QLabel(this);

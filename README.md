@@ -249,7 +249,7 @@ sudo pacman -S extra-cmake-modules qt6-base networkmanager-qt kio ki18n kcoreadd
 ### Build
 
 ```bash
-git clone https://github.com/pegasusheavy/network-manager-openvpn-sso.git
+git clone https://github.com/quinnjr/network-manager-openvpn-sso.git
 cd network-manager-openvpn-sso
 cargo build --release
 ```

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 //! Connection configuration parsing and management
 
@@ -29,7 +29,10 @@ pub struct ConnectionConfig {
     pub username: Option<String>,
     /// Password for initial auth (placeholder for SSO)
     pub password: Option<String>,
-    /// Additional OpenVPN arguments
+    /// Additional OpenVPN arguments. Not populated by `from_nm_settings` — no
+    /// NetworkManager setting is mapped to this field today. It exists for
+    /// programmatic use (e.g. callers constructing a `ConnectionConfig`
+    /// directly) rather than end-user configuration via NM.
     pub extra_args: Vec<String>,
     /// CA certificate path (from vpn.data "ca")
     pub ca: Option<String>,
@@ -433,5 +436,44 @@ mod tests {
             .build_openvpn_args("/run/nm-openvpn-sso/x.sock")
             .join(" ");
         assert!(joined.contains("--auth-user-pass --auth-retry interact"));
+    }
+
+    #[test]
+    fn requires_connection_section() {
+        let mut settings = nm_settings(&[("config", "/etc/vpn/prod.ovpn")]);
+        settings.remove("connection");
+        let err = ConnectionConfig::from_nm_settings(&settings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Missing 'connection' settings section"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn openvpn_args_for_nm_imported_settings() {
+        let config = ConnectionConfig::from_nm_settings(&nm_settings(&[
+            ("ca", "/etc/openvpn/client/ca.crt"),
+            ("cert", "/etc/openvpn/client/client.crt"),
+            ("key", "/etc/openvpn/client/client.key"),
+            ("ta", "/etc/openvpn/client/ta.key"),
+            ("ta-dir", "1"),
+            ("remote", "vpn.example.com:1194"),
+            ("proto", "udp"),
+        ]))
+        .unwrap();
+        assert!(config.config_path.is_none());
+        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock");
+        let has = |expected: &[&str]| args.windows(expected.len()).any(|w| w == expected);
+        assert!(has(&["--client"]));
+        assert!(!has(&["--config"]));
+        assert!(has(&["--ca", "/etc/openvpn/client/ca.crt"]));
+        assert!(has(&["--cert", "/etc/openvpn/client/client.crt"]));
+        assert!(has(&["--key", "/etc/openvpn/client/client.key"]));
+        assert!(has(&["--tls-auth", "/etc/openvpn/client/ta.key", "1"]));
+        // NetworkManager stores "host:port"; OpenVPN wants --remote host port
+        assert!(has(&["--remote", "vpn.example.com", "1194"]));
+        assert!(has(&["--proto", "udp"]));
     }
 }
