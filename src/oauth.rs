@@ -82,7 +82,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The localhost port for receiving the OAuth callback from Google.
+/// The localhost port for receiving the OAuth callback from the identity provider.
 /// This must match CLIENT_OAUTH_CALLBACK_PORT on the server side.
 const LOCAL_OAUTH_CALLBACK_PORT: u16 = 19823;
 
@@ -90,8 +90,8 @@ const LOCAL_OAUTH_CALLBACK_PORT: u16 = 19823;
 ///
 /// Flow:
 /// 1. Start localhost HTTP server on LOCAL_OAUTH_CALLBACK_PORT
-/// 2. Open browser to auth_url (VPN server's /auth/start, which redirects to Google)
-/// 3. Google authenticates user, redirects to localhost:LOCAL_OAUTH_CALLBACK_PORT/oauth/callback
+/// 2. Open browser to auth_url (VPN server's /auth/start, which redirects to the identity provider)
+/// 3. The identity provider authenticates the user and redirects to localhost:LOCAL_OAUTH_CALLBACK_PORT/oauth/callback
 /// 4. We receive code + state, POST them to VPN server's /auth/complete
 /// 5. VPN server exchanges code, verifies user, sends PUSH_REPLY through VPN tunnel
 pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<()> {
@@ -211,7 +211,7 @@ struct SsoCallbackState {
     result_tx: SsoResultSender,
 }
 
-/// Query parameters from Google's OAuth redirect
+/// Query parameters of the identity provider redirect
 #[derive(Debug, Deserialize)]
 struct SsoCallbackParams {
     code: Option<String>,
@@ -220,7 +220,7 @@ struct SsoCallbackParams {
     error_description: Option<String>,
 }
 
-/// Handle the OAuth callback from Google on localhost
+/// Handle the OAuth callback from the identity provider on localhost
 async fn handle_sso_callback(
     State(state): State<Arc<SsoCallbackState>>,
     Query(params): Query<SsoCallbackParams>,
@@ -266,18 +266,20 @@ async fn handle_sso_callback(
         let _ = tx.send(Ok((code, oauth_state)));
     }
 
-    // Show a "please wait" page - the main task will POST to the VPN server
-    Html(r#"<!DOCTYPE html>
-<html><head><title>CoreVPN - Authenticating</title>
-<style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#eee}
-.card{background:#16213e;border-radius:12px;padding:40px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.3)}
-h1{color:#4ecca3;margin-bottom:10px}p{color:#aaa}.spinner{width:40px;height:40px;border:4px solid rgba(78,204,163,.2);border-top:4px solid #4ecca3;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto}
-@keyframes spin{to{transform:rotate(360deg)}}</style></head>
-<body><div class="card"><div class="spinner"></div><h1>Authenticating...</h1>
-<p>Completing VPN authentication. You can close this window shortly.</p></div>
-<script>setTimeout(()=>{document.querySelector('h1').textContent='✓ Authenticated';document.querySelector('.spinner').style.display='none';document.querySelector('p').textContent='VPN connection is being established. You can close this window.'},3000)</script>
-</body></html>"#.to_string())
+    // The main task forwards the code to the VPN server after this page is
+    // shown, so the page cannot claim success yet
+    Html(CALLBACK_PAGE.to_string())
 }
+
+/// Page shown after the identity provider redirects back to localhost
+const CALLBACK_PAGE: &str = r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>VPN login</title>
+<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f4f4f5;color:#18181b}
+.card{background:#fff;border-radius:12px;padding:40px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:28rem}
+p{color:#52525b}</style></head>
+<body><div class="card"><h1>Login received</h1>
+<p>The VPN is finishing the connection. You can close this window; NetworkManager shows when the VPN is up.</p></div>
+</body></html>"#;
 
 /// Try to open a browser via systemd user path activation.
 ///

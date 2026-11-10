@@ -20,7 +20,7 @@
 //! asks for it again.
 
 use std::io::Write as _;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,8 +102,8 @@ pub struct VpnConfig {
     pub prefix: Option<u8>,
     /// Point-to-point peer address (net30/p2p topologies only)
     pub peer_ip: Option<Ipv4Addr>,
-    /// Public address of the VPN server
-    pub remote_ip: Option<Ipv4Addr>,
+    /// Public address of the VPN server (IPv4 or IPv6)
+    pub remote_ip: Option<IpAddr>,
 }
 
 /// Where the current authentication round stands. Decides whether an
@@ -136,7 +136,7 @@ enum Action {
     /// The tunnel is up
     Connected {
         local_ip: Option<Ipv4Addr>,
-        remote_ip: Option<Ipv4Addr>,
+        remote_ip: Option<IpAddr>,
     },
     /// Give up: stop OpenVPN and report this failure
     Fail { reason: String, kind: FailureKind },
@@ -733,7 +733,7 @@ async fn cache_token(connection_uuid: &str, token: String) {
 /// Build the tunnel description for NetworkManager. OpenVPN has already
 /// configured the interface, so the kernel is the source of truth for the
 /// device name and prefix length.
-async fn describe_tunnel(local_ip: Option<Ipv4Addr>, remote_ip: Option<Ipv4Addr>) -> VpnConfig {
+async fn describe_tunnel(local_ip: Option<Ipv4Addr>, remote_ip: Option<IpAddr>) -> VpnConfig {
     let mut config = VpnConfig {
         local_ip,
         remote_ip,
@@ -973,7 +973,7 @@ mod tests {
                 Action::CacheToken("SESS_ID_AT_token1".into()),
                 Action::Connected {
                     local_ip: Some(Ipv4Addr::new(10, 8, 0, 5)),
-                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151)),
+                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151).into()),
                 },
             ]
         );
@@ -1013,7 +1013,7 @@ mod tests {
                 ),
                 Action::Connected {
                     local_ip: Some(Ipv4Addr::new(10, 8, 0, 6)),
-                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151)),
+                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151).into()),
                 },
             ]
         );
@@ -1328,6 +1328,18 @@ mod tests {
         assert_eq!(
             find_interface_with_address(json, Ipv4Addr::new(10, 1, 1, 1)),
             None
+        );
+    }
+
+    #[test]
+    fn reports_ipv6_server_address() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        assert_eq!(
+            p.handle_line(">STATE:1,CONNECTED,SUCCESS,10.8.0.5,2001:db8::1,1194,,,"),
+            vec![Action::Connected {
+                local_ip: Some(Ipv4Addr::new(10, 8, 0, 5)),
+                remote_ip: Some("2001:db8::1".parse().unwrap()),
+            }]
         );
     }
 }

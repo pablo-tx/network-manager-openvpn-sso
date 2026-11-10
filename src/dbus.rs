@@ -5,7 +5,7 @@
 //! (org.freedesktop.NetworkManager.VPN.Plugin)
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -306,6 +306,14 @@ fn ip4_to_nm(addr: Ipv4Addr) -> u32 {
     u32::from_ne_bytes(addr.octets())
 }
 
+/// External gateway as NetworkManager expects it: `u` for IPv4, `ay` for IPv6
+fn gateway_to_nm(addr: IpAddr) -> Value<'static> {
+    match addr {
+        IpAddr::V4(v4) => Value::from(ip4_to_nm(v4)),
+        IpAddr::V6(v6) => Value::from(v6.octets().to_vec()),
+    }
+}
+
 /// Body of the Config signal
 fn config_dict(vpn_config: &VpnConfig) -> HashMap<&'static str, Value<'static>> {
     let mut config = HashMap::new();
@@ -318,7 +326,7 @@ fn config_dict(vpn_config: &VpnConfig) -> HashMap<&'static str, Value<'static>> 
     // route to it through the underlying connection.
     match vpn_config.remote_ip {
         Some(gateway) => {
-            config.insert("gateway", Value::from(ip4_to_nm(gateway)));
+            config.insert("gateway", gateway_to_nm(gateway));
         }
         None => warn!("VPN server address unknown; NetworkManager will reject the Config"),
     }
@@ -339,7 +347,7 @@ fn ip4_config_dict(vpn_config: &VpnConfig) -> HashMap<&'static str, Value<'stati
     if let Some(peer) = vpn_config.peer_ip {
         config.insert("ptp", Value::from(ip4_to_nm(peer)));
     }
-    if let Some(gateway) = vpn_config.remote_ip {
+    if let Some(IpAddr::V4(gateway)) = vpn_config.remote_ip {
         config.insert("gateway", Value::from(ip4_to_nm(gateway)));
     }
     config
@@ -429,7 +437,7 @@ mod tests {
             local_ip: Some(Ipv4Addr::new(10, 8, 0, 8)),
             prefix: Some(24),
             peer_ip: None,
-            remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151)),
+            remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151).into()),
         };
         let dict = ip4_config_dict(&config);
         assert_eq!(
@@ -442,5 +450,21 @@ mod tests {
             Value::from(ip4_to_nm(Ipv4Addr::new(52, 19, 23, 151)))
         );
         assert!(!dict.contains_key("int-gw"));
+    }
+
+    #[test]
+    fn ipv6_server_is_sent_as_byte_array() {
+        let server: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let config = VpnConfig {
+            local_ip: Some(Ipv4Addr::new(10, 8, 0, 8)),
+            remote_ip: Some(server.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_dict(&config)["gateway"],
+            Value::from(server.octets().to_vec())
+        );
+        // Ip4Config has no place for an IPv6 gateway
+        assert!(!ip4_config_dict(&config).contains_key("gateway"));
     }
 }
