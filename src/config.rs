@@ -6,9 +6,12 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use tracing::debug;
 use zbus::zvariant::{OwnedValue, Value};
+
+use crate::ovpn::ConfigFile;
 
 /// VPN connection settings extracted from NetworkManager
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,16 +180,38 @@ impl ConnectionConfig {
         self.password.as_deref().unwrap_or("oauth")
     }
 
-    /// Build OpenVPN command line arguments
-    pub fn build_openvpn_args(&self, management_socket: &str) -> Vec<String> {
+    /// Build OpenVPN command line arguments. `config_file` is the .ovpn
+    /// file prepared by [`crate::ovpn::prepare`] when `config_path` is set.
+    pub fn build_openvpn_args(
+        &self,
+        management_socket: &str,
+        config_file: Option<&ConfigFile>,
+    ) -> Vec<String> {
         let mut args = Vec::new();
 
-        if let Some(ref config_path) = self.config_path {
-            // .ovpn file mode: use --config
+        let config_file = config_file.cloned().or_else(|| {
+            // Not prepared: treat the file as untrusted
+            self.config_path.clone().map(|path| ConfigFile {
+                path,
+                dir: None,
+                untrusted: true,
+            })
+        });
+        if let Some(file) = config_file {
+            // .ovpn file mode. --cd must come first: it applies to files
+            // read after it, and OpenVPN otherwise resolves relative paths
+            // in the file against the service's working directory.
+            if let Some(dir) = &file.dir {
+                args.extend(["--cd".to_string(), dir.to_string_lossy().into_owned()]);
+            }
             args.extend([
                 "--config".to_string(),
-                config_path.to_string_lossy().to_string(),
+                file.path.to_string_lossy().into_owned(),
             ]);
+            // Later options override the file's: no user scripts as root
+            if file.untrusted {
+                args.extend(["--script-security".to_string(), "1".to_string()]);
+            }
         } else {
             // NM-imported mode: build from individual settings
             args.extend([
@@ -283,25 +308,19 @@ impl ConnectionConfig {
         // restart and authenticate again instead of exiting.
         args.extend(["--auth-retry".to_string(), "interact".to_string()]);
 
-        // Common: management interface
+        // Common: management interface. No --script-security: the plugin
+        // runs no scripts, and a root-owned .ovpn file sets its own level.
         args.extend([
             "--management".to_string(),
             management_socket.to_string(),
             "unix".to_string(),
             "--management-query-passwords".to_string(),
             "--management-hold".to_string(),
-            "--script-security".to_string(),
-            "2".to_string(),
         ]);
 
         // Common: apply overrides
         if let Some(ref remote) = self.remote {
-            // NM stores remote as "host:port" — split for OpenVPN's --remote host [port]
-            if let Some((host, port)) = remote.rsplit_once(':') {
-                args.extend(["--remote".to_string(), host.to_string(), port.to_string()]);
-            } else {
-                args.extend(["--remote".to_string(), remote.clone()]);
-            }
+            args.extend(remote_args(remote));
         }
 
         if let Some(port) = self.port {
@@ -316,6 +335,32 @@ impl ConnectionConfig {
 
         args
     }
+}
+
+/// Turn NetworkManager's `remote` value into OpenVPN `--remote host [port
+/// [proto]]` arguments. NetworkManager stores `host[:port[:proto]]`, IPv6
+/// hosts in brackets, several entries separated by commas or spaces.
+fn remote_args(remote: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    for entry in remote.split([',', ' ']).filter(|e| !e.is_empty()) {
+        let parts: Vec<&str> = match entry.strip_prefix('[').and_then(|e| e.split_once(']')) {
+            Some((host, rest)) => std::iter::once(host)
+                .chain(rest.split(':').skip(1))
+                .collect(),
+            // A bare IPv6 address has no port
+            None if entry.parse::<Ipv6Addr>().is_ok() => vec![entry],
+            None => entry.split(':').collect(),
+        };
+        args.push("--remote".to_string());
+        args.extend(
+            parts
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .take(3)
+                .map(str::to_string),
+        );
+    }
+    args
 }
 
 fn get_string(dict: &HashMap<String, OwnedValue>, key: &str) -> Result<String> {
@@ -413,7 +458,7 @@ mod tests {
             ConnectionConfig::from_nm_settings(&nm_settings(&[("config", "/etc/vpn/prod.ovpn")]))
                 .unwrap();
         assert!(!config.uses_credentials());
-        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock");
+        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock", None);
         let joined = args.join(" ");
         assert!(joined.starts_with("--config /etc/vpn/prod.ovpn "));
         assert!(!args.iter().any(|a| a == "--auth-user-pass"));
@@ -433,7 +478,7 @@ mod tests {
         assert!(config.uses_credentials());
         assert_eq!(config.auth_username(), "pablo@example.com");
         let joined = config
-            .build_openvpn_args("/run/nm-openvpn-sso/x.sock")
+            .build_openvpn_args("/run/nm-openvpn-sso/x.sock", None)
             .join(" ");
         assert!(joined.contains("--auth-user-pass --auth-retry interact"));
     }
@@ -464,7 +509,7 @@ mod tests {
         ]))
         .unwrap();
         assert!(config.config_path.is_none());
-        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock");
+        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock", None);
         let has = |expected: &[&str]| args.windows(expected.len()).any(|w| w == expected);
         assert!(has(&["--client"]));
         assert!(!has(&["--config"]));
@@ -475,5 +520,67 @@ mod tests {
         // NetworkManager stores "host:port"; OpenVPN wants --remote host port
         assert!(has(&["--remote", "vpn.example.com", "1194"]));
         assert!(has(&["--proto", "udp"]));
+    }
+
+    #[test]
+    fn openvpn_args_for_prepared_config_files() {
+        let config =
+            ConnectionConfig::from_nm_settings(&nm_settings(&[("config", "/etc/vpn/prod.ovpn")]))
+                .unwrap();
+        let trusted = ConfigFile {
+            path: PathBuf::from("/etc/vpn/prod.ovpn"),
+            dir: Some(PathBuf::from("/etc/vpn")),
+            untrusted: false,
+        };
+        let args = config.build_openvpn_args("/run/x.sock", Some(&trusted));
+        assert_eq!(
+            args[..4],
+            ["--cd", "/etc/vpn", "--config", "/etc/vpn/prod.ovpn"]
+        );
+        // A root-owned file keeps its own script-security level
+        assert!(!args.iter().any(|a| a == "--script-security"));
+
+        let copy = ConfigFile {
+            path: PathBuf::from("/run/nm-openvpn-sso/copy.ovpn"),
+            dir: None,
+            untrusted: true,
+        };
+        let args = config.build_openvpn_args("/run/x.sock", Some(&copy));
+        assert_eq!(
+            args[..4],
+            [
+                "--config",
+                "/run/nm-openvpn-sso/copy.ovpn",
+                "--script-security",
+                "1"
+            ]
+        );
+        assert_eq!(args.iter().filter(|a| *a == "--script-security").count(), 1);
+    }
+
+    #[test]
+    fn splits_nm_remote_entries() {
+        assert_eq!(
+            remote_args("vpn.example.com"),
+            ["--remote", "vpn.example.com"]
+        );
+        assert_eq!(
+            remote_args("a.example.com:1194:udp, b.example.com:443:tcp"),
+            [
+                "--remote",
+                "a.example.com",
+                "1194",
+                "udp",
+                "--remote",
+                "b.example.com",
+                "443",
+                "tcp"
+            ]
+        );
+        assert_eq!(
+            remote_args("[2001:db8::1]:1194"),
+            ["--remote", "2001:db8::1", "1194"]
+        );
+        assert_eq!(remote_args("2001:db8::1"), ["--remote", "2001:db8::1"]);
     }
 }

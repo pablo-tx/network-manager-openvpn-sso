@@ -38,6 +38,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config::ConnectionConfig;
+use crate::ovpn::{self, ConfigFile, Prepared};
 use crate::{oauth, secrets};
 
 /// Runtime directory for management sockets. Lives under /run instead of
@@ -523,20 +524,15 @@ impl OpenVpnManager {
         ensure_runtime_dir().await;
         let _ = tokio::fs::remove_file(&self.socket_path).await;
 
+        let config_file = match self.config.config_path.clone() {
+            Some(path) => Some(self.prepare_config_file(path).await?),
+            None => None,
+        };
         let socket = self
             .socket_path
             .to_str()
             .ok_or_else(|| anyhow!("Management socket path is not valid UTF-8"))?;
-        let mut args = self.config.build_openvpn_args(socket);
-
-        if let Some(sanitized) = self.write_sanitized_config().await {
-            if let Some(pos) = args.iter().position(|a| a == "--config") {
-                if let Some(arg) = args.get_mut(pos + 1) {
-                    *arg = sanitized.to_string_lossy().into_owned();
-                }
-            }
-            self.temp_config_path = Some(sanitized);
-        }
+        let args = self.config.build_openvpn_args(socket, config_file.as_ref());
 
         info!("Starting OpenVPN with args: {:?}", args);
 
@@ -569,29 +565,35 @@ impl OpenVpnManager {
         Ok((BufReader::new(reader), writer))
     }
 
-    /// If the .ovpn file has its own management directives, write a copy
-    /// without them so they cannot clash with ours.
-    async fn write_sanitized_config(&self) -> Option<PathBuf> {
-        let config_path = self.config.config_path.as_ref()?;
-        let contents = match tokio::fs::read_to_string(config_path).await {
-            Ok(contents) => contents,
-            Err(e) => {
-                warn!("Failed to read config file for sanitization: {e}");
-                return None;
-            }
-        };
-        let sanitized = strip_management_directives(&contents)?;
-
-        info!("Config file contains management directives, using a sanitized copy");
-        let temp_path = PathBuf::from(format!("/tmp/nm-openvpn-sso-{}.ovpn", self.config.uuid));
-        match write_private_file(&temp_path, sanitized.as_bytes()) {
-            Ok(()) => Some(temp_path),
-            Err(e) => {
-                warn!(
-                    "Failed to write sanitized config {}: {e}",
-                    temp_path.display()
-                );
-                None
+    /// Decide how OpenVPN reads the .ovpn file (see [`ovpn`]) and write
+    /// the private copy if one is needed. The copy lives in the runtime
+    /// directory: SELinux lets OpenVPN read files there, but not files
+    /// NetworkManager creates in /tmp.
+    async fn prepare_config_file(&mut self, path: PathBuf) -> Result<ConfigFile> {
+        let prepared = tokio::task::spawn_blocking(move || ovpn::prepare(&path))
+            .await
+            .context("Config file check panicked")??;
+        match prepared {
+            Prepared::InPlace { path, dir } => Ok(ConfigFile {
+                path,
+                dir: Some(dir),
+                untrusted: false,
+            }),
+            Prepared::Copy {
+                text,
+                dir,
+                untrusted,
+            } => {
+                let copy = PathBuf::from(RUNTIME_DIR)
+                    .join(format!("nm-openvpn-sso-{}.ovpn", self.config.uuid));
+                write_private_file(&copy, text.as_bytes())
+                    .with_context(|| format!("Failed to write {}", copy.display()))?;
+                self.temp_config_path = Some(copy.clone());
+                Ok(ConfigFile {
+                    path: copy,
+                    dir,
+                    untrusted,
+                })
             }
         }
     }
@@ -711,22 +713,6 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(contents)
-}
-
-/// Remove management directives from an .ovpn file. Returns None when
-/// there is nothing to remove.
-fn strip_management_directives(contents: &str) -> Option<String> {
-    let is_management = |line: &&str| line.trim_start().starts_with("management");
-    if !contents.lines().any(|line| is_management(&line)) {
-        return None;
-    }
-    Some(
-        contents
-            .lines()
-            .filter(|line| !is_management(line))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
 }
 
 async fn cache_token(connection_uuid: &str, token: String) {
@@ -1342,17 +1328,6 @@ mod tests {
         assert_eq!(
             find_interface_with_address(json, Ipv4Addr::new(10, 1, 1, 1)),
             None
-        );
-    }
-
-    #[test]
-    fn strips_management_directives_only_when_present() {
-        assert_eq!(strip_management_directives("client\nremote x 1194\n"), None);
-        assert_eq!(
-            strip_management_directives(
-                "client\nmanagement 127.0.0.1 7505\n  management-hold\nverb 3"
-            ),
-            Some("client\nverb 3".into())
         );
     }
 }

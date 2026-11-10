@@ -5,6 +5,7 @@ mod config;
 mod dbus;
 mod oauth;
 mod openvpn;
+mod ovpn;
 mod secrets;
 
 use anyhow::Result;
