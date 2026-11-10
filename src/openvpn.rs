@@ -1,77 +1,307 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Pegasus Heavy Industries LLC
 
-//! OpenVPN process management and management interface protocol
+//! OpenVPN process management and management interface protocol.
+//!
+//! The module has two halves:
+//!
+//! * [`Protocol`] is a pure state machine that turns management-interface
+//!   lines into [`Action`]s. Every authentication decision lives here, so the
+//!   connect / re-authenticate / reconnect flow can be unit tested against
+//!   real OpenVPN transcripts.
+//! * [`OpenVpnManager`] owns the OpenVPN process and the management socket
+//!   and carries out those actions: socket writes, browser launch, token
+//!   cache, and events for the D-Bus layer.
+//!
+//! One OpenVPN process lives for the whole connection. OpenVPN restarts
+//! itself internally (ping-restart, network change, rejected auth-token) and
+//! the protocol follows along: it releases every management hold, answers
+//! every credential request, and re-runs SSO in the browser when the server
+//! asks for it again.
 
-use anyhow::{anyhow, Context, Result};
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::net::Ipv4Addr;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config::ConnectionConfig;
-use crate::secrets;
+use crate::{oauth, secrets};
 
-/// Events from the OpenVPN management interface
-#[derive(Debug, Clone)]
+/// Runtime directory for management sockets. Lives under /run instead of
+/// /tmp because SELinux confines openvpn and denies sockets in /tmp.
+const RUNTIME_DIR: &str = "/run/nm-openvpn-sso";
+
+/// Give up after this many consecutive SSO rounds fail without connecting,
+/// so an unattended machine does not open browser tabs forever.
+const MAX_SSO_FAILURES: u32 = 3;
+
+/// How long OpenVPN gets to exit after SIGTERM before it is killed.
+const OPENVPN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Assumed lifetime of a cached server auth-token. The server does not
+/// announce the real lifetime; a stale token only costs one rejected attempt.
+const CACHED_TOKEN_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Events reported to the D-Bus layer
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VpnEvent {
-    /// Connection state changed
+    /// Connection progress
     State(VpnState),
-    /// Authentication required (with optional auth URL for SSO)
-    AuthRequired { auth_url: Option<String> },
-    /// Connection established with config
+    /// Tunnel is up (initially or again after a reconnect)
     Connected(VpnConfig),
-    /// Connection failed
-    Failed(String),
-    /// Log message
-    Log(String),
+    /// The connection failed for good; `State(Stopped)` follows
+    Failed { reason: String, kind: FailureKind },
 }
 
-/// VPN connection states (matching NM states)
+/// Why a connection failed, mapped to NMVpnPluginFailure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+pub enum FailureKind {
+    Login,
+    Connect,
+}
+
+/// Connection progress as seen by OpenVPN
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpnState {
-    Unknown = 0,
-    Init = 1,
-    Shutdown = 2,
-    Starting = 3,
-    Started = 4,
-    Stopping = 5,
-    Stopped = 6,
-    // NM-specific states
-    NeedAuth = 7,
-    Connecting = 8,
-    GettingConfig = 9,
-    Connected = 10,
-    Failed = 11,
+    /// Process starting, resolving or contacting the server
+    Connecting,
+    /// TLS handshake or authentication in progress (including SSO pending)
+    Authenticating,
+    /// Authenticated, receiving the pushed configuration
+    GettingConfig,
+    /// The tunnel was up and OpenVPN is re-establishing it
+    Reconnecting,
+    /// Shutting down
+    Stopping,
+    /// Process gone
+    Stopped,
 }
 
-/// IP configuration received from OpenVPN
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+/// Tunnel parameters reported to NetworkManager
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VpnConfig {
+    /// Tunnel interface name (e.g. tun0)
     pub tun_device: Option<String>,
-    pub local_ip: Option<String>,
-    pub remote_ip: Option<String>,
-    pub netmask: Option<String>,
-    pub gateway: Option<String>,
-    pub mtu: Option<u32>,
-    pub dns_servers: Vec<String>,
-    pub dns_search: Vec<String>,
-    pub routes: Vec<Route>,
+    /// Address assigned to us inside the tunnel
+    pub local_ip: Option<Ipv4Addr>,
+    /// Prefix length of `local_ip` as configured on the interface
+    pub prefix: Option<u8>,
+    /// Point-to-point peer address (net30/p2p topologies only)
+    pub peer_ip: Option<Ipv4Addr>,
+    /// Public address of the VPN server
+    pub remote_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Route {
-    pub network: String,
-    pub netmask: String,
-    pub gateway: Option<String>,
+/// What we answered the most recent credential request with
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credentials {
+    CachedToken,
+    Placeholder,
+}
+
+/// Side effects requested by [`Protocol`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    /// Write a command to the management interface
+    Send(String),
+    /// Report an event to the D-Bus layer
+    Emit(VpnEvent),
+    /// Open this SSO URL in the user's browser
+    OpenBrowser(String),
+    /// Remember this server auth-token for the next connection
+    CacheToken(String),
+    /// Forget the cached auth-token; the server no longer accepts it
+    ClearCachedToken,
+    /// The tunnel is up
+    Connected {
+        local_ip: Option<Ipv4Addr>,
+        remote_ip: Option<Ipv4Addr>,
+    },
+    /// Give up: stop OpenVPN and report this failure
+    Fail { reason: String, kind: FailureKind },
+}
+
+/// Management interface state machine
+#[derive(Debug)]
+struct Protocol {
+    username: String,
+    password: String,
+    /// Auth-token from an earlier connection, tried once before SSO
+    cached_token: Option<String>,
+    /// What we sent for the current credential request
+    last_sent: Option<Credentials>,
+    /// SSO URL already opened in the current authentication round
+    opened_url: Option<String>,
+    /// SSO rounds that failed since the tunnel was last up
+    sso_failures: u32,
+}
+
+impl Protocol {
+    fn new(username: &str, password: &str, cached_token: Option<String>) -> Self {
+        Self {
+            username: username.to_string(),
+            password: password.to_string(),
+            cached_token,
+            last_sent: None,
+            opened_url: None,
+            sso_failures: 0,
+        }
+    }
+
+    /// Handle one line from the management interface
+    fn handle_line(&mut self, line: &str) -> Vec<Action> {
+        if line.starts_with(">HOLD:") {
+            // OpenVPN holds before the first connection and again before
+            // every internal restart. Not releasing it stalls the tunnel.
+            return vec![Action::Send("hold release\n".to_string())];
+        }
+        if let Some(msg) = line.strip_prefix(">PASSWORD:") {
+            return self.on_password(msg);
+        }
+        if let Some(msg) = line.strip_prefix(">STATE:") {
+            return self.on_state(msg);
+        }
+        if let Some(msg) = line
+            .strip_prefix(">INFOMSG:")
+            .or_else(|| line.strip_prefix(">INFO:"))
+        {
+            return extract_auth_url(msg)
+                .map(|url| self.open_url(url))
+                .unwrap_or_default();
+        }
+        if let Some(msg) = line.strip_prefix(">FATAL:") {
+            return vec![Action::Fail {
+                reason: format!("OpenVPN fatal error: {msg}"),
+                kind: FailureKind::Connect,
+            }];
+        }
+        Vec::new()
+    }
+
+    fn on_password(&mut self, msg: &str) -> Vec<Action> {
+        if let Some(token) = msg.strip_prefix("Auth-Token:") {
+            let token = token.trim();
+            if token.is_empty() {
+                return Vec::new();
+            }
+            return vec![Action::CacheToken(token.to_string())];
+        }
+        if msg.starts_with("Need 'Auth'") {
+            return self.on_credentials_needed();
+        }
+        if msg.starts_with("Verification Failed") {
+            return self.on_verification_failed(msg);
+        }
+        warn!("Unsupported password request from OpenVPN: {msg}");
+        Vec::new()
+    }
+
+    fn on_credentials_needed(&mut self) -> Vec<Action> {
+        // A credential request starts a new authentication round: the next
+        // SSO URL must open the browser even if it repeats the previous one.
+        self.opened_url = None;
+
+        if self.sso_failures >= MAX_SSO_FAILURES {
+            return vec![Action::Fail {
+                reason: format!(
+                    "SSO authentication failed {} times in a row",
+                    self.sso_failures
+                ),
+                kind: FailureKind::Login,
+            }];
+        }
+
+        let (kind, password) = match self.cached_token.take() {
+            Some(token) => (Credentials::CachedToken, token),
+            None => (Credentials::Placeholder, self.password.clone()),
+        };
+        self.last_sent = Some(kind);
+
+        // The username must be the same for placeholder credentials and
+        // cached tokens: OpenVPN auth-tokens are bound to the username.
+        vec![
+            Action::Send(format!(
+                "username \"Auth\" \"{}\"\n",
+                escape_management_string(&self.username)
+            )),
+            Action::Send(format!(
+                "password \"Auth\" \"{}\"\n",
+                escape_management_string(&password)
+            )),
+        ]
+    }
+
+    fn on_verification_failed(&mut self, msg: &str) -> Vec<Action> {
+        // Whatever token we hold is dead: the cached one we just sent, or the
+        // session token OpenVPN presented during renegotiation. With
+        // --auth-retry interact OpenVPN restarts and asks for credentials
+        // again, and the next round goes through SSO.
+        let mut actions = vec![Action::ClearCachedToken];
+
+        if self.last_sent.take() == Some(Credentials::Placeholder) {
+            // The interactive SSO round itself failed (timeout, denied login)
+            self.sso_failures += 1;
+        }
+        if let Some(url) = extract_auth_url(msg) {
+            actions.extend(self.open_url(url));
+        }
+        actions
+    }
+
+    fn on_state(&mut self, msg: &str) -> Vec<Action> {
+        // time,name,description,local_ip,remote_ip,remote_port,local_addr,local_port,local_ipv6
+        let fields: Vec<&str> = msg.split(',').collect();
+        let field = |i: usize| fields.get(i).copied().filter(|s| !s.is_empty());
+
+        let state = match field(1).unwrap_or_default() {
+            "CONNECTING" | "WAIT" | "RESOLVE" | "TCP_CONNECT" => VpnState::Connecting,
+            "AUTH" => VpnState::Authenticating,
+            "AUTH_PENDING" => {
+                let mut actions = extract_open_url(msg)
+                    .map(|url| self.open_url(url))
+                    .unwrap_or_default();
+                actions.push(Action::Emit(VpnEvent::State(VpnState::Authenticating)));
+                return actions;
+            }
+            "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => VpnState::GettingConfig,
+            "CONNECTED" => {
+                self.sso_failures = 0;
+                self.last_sent = None;
+                self.opened_url = None;
+                return vec![Action::Connected {
+                    local_ip: field(3).and_then(|s| s.parse().ok()),
+                    remote_ip: field(4).and_then(|s| s.parse().ok()),
+                }];
+            }
+            "RECONNECTING" => VpnState::Reconnecting,
+            "EXITING" => VpnState::Stopping,
+            _ => return Vec::new(),
+        };
+        vec![Action::Emit(VpnEvent::State(state))]
+    }
+
+    /// Open `url` unless it was already opened in this authentication round
+    /// (servers often announce the same URL via AUTH_PENDING and INFOMSG).
+    fn open_url(&mut self, url: String) -> Vec<Action> {
+        if self.opened_url.as_deref() == Some(url.as_str()) {
+            return Vec::new();
+        }
+        self.opened_url = Some(url.clone());
+        vec![Action::OpenBrowser(url)]
+    }
 }
 
 /// OpenVPN process manager
@@ -80,1162 +310,896 @@ pub struct OpenVpnManager {
     socket_path: PathBuf,
     process: Option<Child>,
     event_tx: mpsc::Sender<VpnEvent>,
-    /// Cached auth URL from server (received via >INFO:)
-    pending_auth_url: Option<String>,
-    /// Flag to track if SSO browser auth has been initiated (to prevent duplicates)
-    sso_auth_initiated: bool,
-    /// Auth token received from server after successful authentication
-    /// This can be used for reconnection without browser auth
-    auth_token: Option<String>,
-    /// Path to a sanitized temp config file (if we created one)
+    /// Sanitized copy of the .ovpn file (only if we had to create one)
     temp_config_path: Option<PathBuf>,
-    /// Whether to skip cached credentials on next connect attempt
-    skip_cached_credentials: bool,
-    /// Stop signal — triggered by disconnect() to break the management loop
-    /// without needing to lock the manager mutex first.
-    pub stop: Arc<Notify>,
+    /// Triggered by the D-Bus layer to end the connection
+    stop: Arc<Notify>,
+    /// Running browser / OAuth callback flow
+    sso_task: Option<JoinHandle<()>>,
+    /// Failure decided by the protocol, reported once OpenVPN has exited
+    failure: Option<(String, FailureKind)>,
 }
 
 impl OpenVpnManager {
     pub fn new(config: ConnectionConfig, event_tx: mpsc::Sender<VpnEvent>) -> Self {
-        // Use /run/nm-openvpn-sso/ instead of /tmp to avoid SELinux denials
-        // on Fedora/RHEL where openvpn is confined and cannot create sockets in /tmp.
-        let runtime_dir = PathBuf::from("/run/nm-openvpn-sso");
-        let socket_path = runtime_dir.join(format!("nm-openvpn-sso-{}.sock", config.uuid));
+        let socket_path =
+            PathBuf::from(RUNTIME_DIR).join(format!("nm-openvpn-sso-{}.sock", config.uuid));
 
         Self {
             config,
             socket_path,
             process: None,
             event_tx,
-            pending_auth_url: None,
-            sso_auth_initiated: false,
-            auth_token: None,
             temp_config_path: None,
-            skip_cached_credentials: false,
             stop: Arc::new(Notify::new()),
+            sso_task: None,
+            failure: None,
         }
     }
 
-    /// Start OpenVPN process and wait for management socket.
-    /// Returns the management stream (reader, writer).
-    async fn start_openvpn(
-        &mut self,
-    ) -> Result<(
-        BufReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
-    )> {
-        // Kill any stale openvpn processes using the same management socket
-        self.kill_stale_openvpn_processes().await;
+    /// Handle used to stop [`run`](Self::run) from another task
+    pub fn stop_handle(&self) -> Arc<Notify> {
+        self.stop.clone()
+    }
 
-        // Ensure runtime directory exists (SELinux-friendly location)
-        if let Some(parent) = self.socket_path.parent() {
-            if !parent.exists() {
-                info!("Creating runtime directory: {}", parent.display());
-                match tokio::fs::create_dir_all(parent).await {
-                    Ok(()) => {
-                        let _ = std::fs::set_permissions(
-                            parent,
-                            std::fs::Permissions::from_mode(0o755),
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to create runtime directory {}: {}",
-                            parent.display(),
-                            e
-                        );
+    /// Run the connection until it is stopped or fails for good. Always ends
+    /// by reporting `Stopped`, preceded by `Failed` unless stopped on request.
+    pub async fn run(mut self) {
+        let result = self.supervise().await;
+        self.shutdown().await;
+
+        if let Err(e) = result {
+            let (reason, kind) = self
+                .failure
+                .take()
+                .unwrap_or_else(|| (format!("{e:#}"), FailureKind::Connect));
+            error!("VPN connection failed: {reason}");
+            self.emit(VpnEvent::Failed { reason, kind }).await;
+        }
+        self.emit(VpnEvent::State(VpnState::Stopped)).await;
+    }
+
+    /// Start OpenVPN and drive the management interface. Returns Ok(()) when
+    /// stopped on request and Err(_) when the connection ended on its own.
+    async fn supervise(&mut self) -> Result<()> {
+        let (mut reader, mut writer) = match self.start_openvpn().await {
+            Ok(rw) => rw,
+            Err(e) => {
+                if let Some(child) = self.process.as_mut() {
+                    let _ = child.start_kill();
+                }
+                return Err(e);
+            }
+        };
+
+        let cached_token = secrets::get_cached_credentials(&self.config.uuid)
+            .await
+            .filter(|tokens| tokens.is_valid())
+            .map(|tokens| tokens.access_token);
+        if cached_token.is_some() {
+            info!("Found cached auth-token, trying it before SSO");
+        }
+        let mut protocol = Protocol::new(
+            self.config.auth_username(),
+            self.config.auth_password(),
+            cached_token,
+        );
+
+        writer
+            .write_all(b"state on\nhold release\n")
+            .await
+            .context("Failed to write to management interface")?;
+
+        let stop = self.stop.clone();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            tokio::select! {
+                biased;
+                _ = stop.notified() => {
+                    info!("Stop requested, terminating OpenVPN");
+                    self.emit(VpnEvent::State(VpnState::Stopping)).await;
+                    let _ = writer.write_all(b"signal SIGTERM\n").await;
+                    return Ok(());
+                }
+                read = reader.read_until(b'\n', &mut buf) => {
+                    if read.context("Failed to read from management interface")? == 0 {
+                        return Err(anyhow!(
+                            "OpenVPN exited unexpectedly (management interface closed)"
+                        ));
                     }
                 }
+            }
+
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end();
+            if !line.starts_with(">BYTECOUNT") {
+                info!("MGMT: {}", redact_secrets(line));
+            }
+            for action in protocol.handle_line(line) {
+                self.apply(action, &mut writer).await?;
             }
         }
+    }
 
-        // Clean up old socket if exists
+    async fn apply(&mut self, action: Action, writer: &mut OwnedWriteHalf) -> Result<()> {
+        match action {
+            Action::Send(command) => writer
+                .write_all(command.as_bytes())
+                .await
+                .context("Failed to write to management interface")?,
+            Action::Emit(event) => self.emit(event).await,
+            Action::OpenBrowser(url) => self.start_browser_auth(url),
+            Action::CacheToken(token) => cache_token(&self.config.uuid, token).await,
+            Action::ClearCachedToken => secrets::clear_cached_credentials(&self.config.uuid).await,
+            Action::Connected {
+                local_ip,
+                remote_ip,
+            } => {
+                let config = describe_tunnel(local_ip, remote_ip).await;
+                info!("VPN connected: {config:?}");
+                self.emit(VpnEvent::Connected(config)).await;
+            }
+            Action::Fail { reason, kind } => {
+                warn!("Giving up: {reason}");
+                self.failure = Some((reason, kind));
+                let _ = writer.write_all(b"signal SIGTERM\n").await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn emit(&self, event: VpnEvent) {
+        if self.event_tx.send(event).await.is_err() {
+            warn!("D-Bus event channel closed");
+        }
+    }
+
+    /// Open the SSO URL in the background so the management loop keeps
+    /// running (and can still be stopped) while the user logs in.
+    fn start_browser_auth(&mut self, url: String) {
+        if let Some(previous) = self.sso_task.take() {
+            previous.abort();
+        }
+        info!("Starting SSO authentication in the browser");
+        self.sso_task = Some(tokio::spawn(async move {
+            let result = match oauth::localhost_callback_base(&url) {
+                Some(server_base) => oauth::authenticate_sso(&url, &server_base).await,
+                None => oauth::authenticate(&url).await,
+            };
+            if let Err(e) = result {
+                error!("SSO authentication failed: {e:#}");
+            }
+        }));
+    }
+
+    /// Start OpenVPN and connect to its management socket
+    async fn start_openvpn(&mut self) -> Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf)> {
+        kill_stale_openvpn_processes(&self.socket_path).await;
+        ensure_runtime_dir().await;
         let _ = tokio::fs::remove_file(&self.socket_path).await;
 
-        // Build OpenVPN arguments
-        let mut args = self
-            .config
-            .build_openvpn_args(self.socket_path.to_str().unwrap());
+        let socket = self
+            .socket_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Management socket path is not valid UTF-8"))?;
+        let mut args = self.config.build_openvpn_args(socket);
 
-        // If using --config, strip any management directives from the .ovpn file
-        if let Some(ref config_path) = self.config.config_path {
-            match tokio::fs::read_to_string(config_path).await {
-                Ok(contents) => {
-                    if contents.lines().any(|l| {
-                        let trimmed = l.trim_start();
-                        trimmed.starts_with("management") || trimmed.starts_with("<management>")
-                    }) {
-                        info!("Config file contains management directive, creating sanitized temp copy");
-                        let sanitized: String = contents
-                            .lines()
-                            .filter(|l| {
-                                let trimmed = l.trim_start();
-                                !trimmed.starts_with("management")
-                                    && !trimmed.starts_with("<management>")
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let temp_path = format!("/tmp/nm-openvpn-sso-{}.ovpn", self.config.uuid);
-                        match tokio::fs::write(&temp_path, sanitized).await {
-                            Ok(()) => {
-                                if let Some(pos) = args.iter().position(|a| a == "--config") {
-                                    if pos + 1 < args.len() {
-                                        args[pos + 1] = temp_path.clone();
-                                    }
-                                }
-                                self.temp_config_path = Some(PathBuf::from(temp_path));
-                            }
-                            Err(e) => {
-                                warn!("Failed to write sanitized config: {}", e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to read config file for sanitization: {}", e);
+        if let Some(sanitized) = self.write_sanitized_config().await {
+            if let Some(pos) = args.iter().position(|a| a == "--config") {
+                if let Some(arg) = args.get_mut(pos + 1) {
+                    *arg = sanitized.to_string_lossy().into_owned();
                 }
             }
+            self.temp_config_path = Some(sanitized);
         }
 
         info!("Starting OpenVPN with args: {:?}", args);
 
-        let child = Command::new("openvpn")
+        let mut child = Command::new("openvpn")
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("Failed to start OpenVPN process")?;
 
-        let pid = child.id();
-        info!("OpenVPN started with PID: {:?}", pid);
+        // OpenVPN logs to stdout. An undrained pipe fills up after a day or
+        // so of renegotiations and then blocks OpenVPN completely.
+        if let Some(stdout) = child.stdout.take() {
+            forward_output(stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            forward_output(stderr);
+        }
 
+        info!("OpenVPN started with PID {:?}", child.id());
         self.process = Some(child);
         self.wait_for_socket().await?;
 
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .context("Failed to connect to management socket")?;
-
         let (reader, writer) = stream.into_split();
         Ok((BufReader::new(reader), writer))
     }
 
-    /// Start OpenVPN and manage the connection.
-    /// Automatically retries with empty credentials if cached tokens are rejected.
-    pub async fn connect(&mut self) -> Result<()> {
-        // Try up to 2 times: first with cached credentials, then with empty
-        for attempt in 0..2 {
-            if attempt == 1 {
-                info!("Retrying connection with empty credentials (cached token was rejected)");
-                self.pending_auth_url = None;
-                self.sso_auth_initiated = false;
-                self.skip_cached_credentials = true;
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    /// If the .ovpn file has its own management directives, write a copy
+    /// without them so they cannot clash with ours.
+    async fn write_sanitized_config(&self) -> Option<PathBuf> {
+        let config_path = self.config.config_path.as_ref()?;
+        let contents = match tokio::fs::read_to_string(config_path).await {
+            Ok(contents) => contents,
+            Err(e) => {
+                warn!("Failed to read config file for sanitization: {e}");
+                return None;
             }
+        };
+        let sanitized = strip_management_directives(&contents)?;
 
-            let (reader, writer) = match self.start_openvpn().await {
-                Ok(rw) => rw,
-                Err(e) => {
-                    if attempt == 0 {
-                        warn!("Failed to start OpenVPN: {}", e);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            };
-
-            match self.run_management_loop_with_stream(reader, writer).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if attempt == 0 && e.to_string().contains("CACHED_TOKEN_REJECTED") {
-                        // Kill the current OpenVPN process before retry
-                        if let Some(mut proc) = self.process.take() {
-                            let _ = proc.kill().await;
-                            let _ = proc.wait().await;
-                        }
-                        if let Some(ref temp_path) = self.temp_config_path {
-                            let _ = tokio::fs::remove_file(temp_path).await;
-                            self.temp_config_path = None;
-                        }
-                        continue;
-                    }
-                    return Err(e);
-                }
+        info!("Config file contains management directives, using a sanitized copy");
+        let temp_path = PathBuf::from(format!("/tmp/nm-openvpn-sso-{}.ovpn", self.config.uuid));
+        match write_private_file(&temp_path, sanitized.as_bytes()) {
+            Ok(()) => Some(temp_path),
+            Err(e) => {
+                warn!(
+                    "Failed to write sanitized config {}: {e}",
+                    temp_path.display()
+                );
+                None
             }
-        }
-
-        Err(anyhow!("Connection failed after retry"))
-    }
-
-    /// Kill any stale openvpn processes that reference our management socket path.
-    /// This handles the case where a previous connection attempt left orphan processes.
-    async fn kill_stale_openvpn_processes(&self) {
-        let socket_str = self.socket_path.to_string_lossy().to_string();
-        match Command::new("pkill")
-            .args(["-f", &format!("openvpn.*{}", socket_str)])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                info!("Killed stale openvpn processes using socket {}", socket_str);
-                // Give processes time to exit
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            _ => {}
         }
     }
 
-    /// Wait for the management socket to become available
+    /// Wait for the management socket to appear
     async fn wait_for_socket(&mut self) -> Result<()> {
         for _ in 0..50 {
             if self.socket_path.exists() {
                 return Ok(());
             }
-            // Check if OpenVPN has already exited (e.g., config error)
-            if let Some(ref mut child) = self.process {
-                if let Ok(Some(status)) = child.try_wait() {
-                    // Read both stdout and stderr — OpenVPN logs errors to either
-                    let mut stdout_msg = String::new();
-                    let mut stderr_msg = String::new();
-
-                    if let Some(mut stdout) = child.stdout.take() {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = stdout.read_to_end(&mut buf).await;
-                        stdout_msg = String::from_utf8_lossy(&buf).to_string();
-                    }
-                    if let Some(mut stderr) = child.stderr.take() {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = stderr.read_to_end(&mut buf).await;
-                        stderr_msg = String::from_utf8_lossy(&buf).to_string();
-                    }
-
-                    error!("OpenVPN exited early with status: {}", status);
-                    if !stdout_msg.is_empty() {
-                        error!("OpenVPN stdout: {}", stdout_msg);
-                    }
-                    if !stderr_msg.is_empty() {
-                        error!("OpenVPN stderr: {}", stderr_msg);
-                    }
-
-                    let combined = format!("stdout: {} stderr: {}", stdout_msg, stderr_msg);
+            if let Some(child) = self.process.as_mut() {
+                if let Some(status) = child.try_wait()? {
                     return Err(anyhow!(
-                        "OpenVPN exited with status {} before creating management socket. {}",
-                        status,
-                        combined
+                        "OpenVPN exited with {status} before creating the management socket \
+                         (its output is logged above)"
                     ));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(anyhow!("Management socket not created after 5s"))
     }
 
-    /// Wait for the server to send an SSO URL via management messages.
-    /// Reads messages from the management interface for up to 60 seconds.
-    async fn wait_for_sso_url(&mut self, reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) {
-        let wait_start = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(60);
-        let mut next_line = String::new();
-
-        while self.pending_auth_url.is_none() && wait_start.elapsed() < max_wait {
-            next_line.clear();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                reader.read_line(&mut next_line),
-            )
-            .await
-            {
-                Ok(Ok(n)) if n > 0 => {
-                    let line = next_line.trim();
-                    info!("MGMT (waiting for SSO): {}", line);
-
-                    if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
-                        let info = line
-                            .strip_prefix(">INFO:")
-                            .or_else(|| line.strip_prefix(">INFOMSG:"))
-                            .unwrap_or(line);
-                        info!("Server INFO/MSG: {}", info);
-                        if let Some(url) = extract_auth_url(info) {
-                            info!("Received auth URL from server: {}", url);
-                            self.pending_auth_url = Some(url);
-                        }
-                    } else if line.starts_with(">PASSWORD:Verification Failed") {
-                        info!("Auth verification failed - checking for SSO URL");
-                        if let Some(url) = extract_auth_url(line) {
-                            info!("Found auth URL in verification failure: {}", url);
-                            self.pending_auth_url = Some(url);
-                        }
-                    } else if line.contains(">STATE:") && line.contains(",CONNECTED,") {
-                        info!("Connection established without SSO");
-                        break;
-                    } else if line.contains("WEB_AUTH::") {
-                        if let Some(url) = extract_auth_url(line) {
-                            info!("Found auth URL in message: {}", url);
-                            self.pending_auth_url = Some(url);
-                        }
-                    }
-                }
-                Ok(Ok(_)) => break,
-                Ok(Err(e)) => {
-                    warn!("Error reading during SSO wait: {}", e);
-                    break;
-                }
-                Err(_) => continue,
-            }
+    /// Wait for OpenVPN to exit (killing it if needed) and clean up
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.sso_task.take() {
+            task.abort();
         }
-
-        if self.pending_auth_url.is_none() && wait_start.elapsed() >= max_wait {
-            warn!(
-                "Timeout waiting for SSO URL from server after {:?}",
-                wait_start.elapsed()
-            );
-        }
-    }
-
-    /// Main management interface loop using a pre-connected stream
-    async fn run_management_loop_with_stream(
-        &mut self,
-        mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-        mut writer: tokio::net::unix::OwnedWriteHalf,
-    ) -> Result<()> {
-        let mut line = String::new();
-
-        // State tracking
-        let mut vpn_config = VpnConfig::default();
-        let mut initial_auth_sent = false;
-        let mut used_cached_token = false;
-
-        // Check for cached credentials before starting
-        let cached_token = if self.skip_cached_credentials {
-            info!("Skipping cached credentials (previous attempt rejected)");
-            None
-        } else {
-            secrets::get_cached_credentials(&self.config.uuid).await
-        };
-        if cached_token.is_some() {
-            info!(
-                "Found cached credentials for connection {}",
-                self.config.uuid
-            );
-        }
-
-        // Send initial commands
-        writer.write_all(b"state on\n").await?;
-        writer.write_all(b"hold release\n").await?;
-
-        self.event_tx
-            .send(VpnEvent::State(VpnState::Starting))
-            .await
-            .ok();
-
-        loop {
-            line.clear();
-            tokio::select! {
-                result = reader.read_line(&mut line) => {
-                    let n = result?;
-                    if n == 0 {
-                        warn!("Management connection closed");
-                        break;
-                    }
-                }
-                _ = self.stop.notified() => {
-                    info!("Received stop signal, exiting management loop");
-                    let _ = writer.write_all(b"signal SIGTERM\n").await;
-                    break;
-                }
-            }
-
-            let line = line.trim();
-            info!("MGMT: {}", line);
-
-            // Parse management interface messages
-            if line.starts_with(">PASSWORD:") {
-                // Password/auth required or auth-token received
-                let auth_type = line.strip_prefix(">PASSWORD:").unwrap().trim();
-
-                // Check if this is an Auth-Token (sent by server after successful auth)
-                // Format: >PASSWORD:Auth-Token:SESS_ID_AT_...
-                if auth_type.starts_with("Auth-Token:") {
-                    let token = auth_type.strip_prefix("Auth-Token:").unwrap().trim();
-                    info!("Received Auth-Token from server (length: {})", token.len());
-                    if !token.is_empty() {
-                        self.auth_token = Some(token.to_string());
-                    }
-                    continue;
-                }
-
-                // Check if this is a verification failure or auth pending (contains URL)
-                if auth_type.contains("Verification Failed") || auth_type.contains("AUTH_PENDING") {
-                    // Server is responding to our initial auth - look for URL
-                    if let Some(url) = extract_auth_url(auth_type) {
-                        info!("Found auth URL in verification response: {}", url);
-                        self.pending_auth_url = Some(url);
-                    }
-
-                    // Now handle the real SSO auth with the URL
-                    if let Some(url) = self.pending_auth_url.clone() {
-                        info!("Performing browser-based SSO authentication");
-                        self.event_tx
-                            .send(VpnEvent::AuthRequired {
-                                auth_url: Some(url.clone()),
-                            })
-                            .await
-                            .ok();
-
-                        if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
-                            error!("SSO authentication failed: {}", e);
-                            self.event_tx
-                                .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                .await
-                                .ok();
-                            return Err(e);
-                        }
-                    } else if !initial_auth_sent {
-                        // Server rejected empty/default credentials before we sent any.
-                        // Send placeholder credentials now and wait for the SSO URL.
-                        warn!(
-                            "Server sent '{}' before credentials were sent; sending placeholder credentials now",
-                            auth_type
-                        );
-
-                        let username = self.config.username.as_deref().unwrap_or("oauth");
-                        let password = self.config.password.as_deref().unwrap_or("oauth");
-                        writer
-                            .write_all(format!("username \"Auth\" \"{}\"\n", username).as_bytes())
-                            .await?;
-                        writer
-                            .write_all(format!("password \"Auth\" \"{}\"\n", password).as_bytes())
-                            .await?;
-                        writer.flush().await?;
-
-                        initial_auth_sent = true;
-                        info!("Sent placeholder credentials, waiting for server response...");
-
-                        self.wait_for_sso_url(&mut reader).await;
-
-                        if let Some(url) = self.pending_auth_url.clone() {
-                            info!("Got SSO URL after retry, starting browser authentication");
-                            self.event_tx
-                                .send(VpnEvent::AuthRequired {
-                                    auth_url: Some(url.clone()),
-                                })
-                                .await
-                                .ok();
-
-                            if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
-                                error!("SSO authentication failed: {}", e);
-                                self.event_tx
-                                    .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                    .await
-                                    .ok();
-                                return Err(e);
-                            }
-                        } else {
-                            warn!("No SSO URL received after sending placeholder credentials");
-                        }
-                    } else if used_cached_token {
-                        // Cached credentials were rejected. Clear them so the
-                        // next attempt uses empty credentials and triggers SSO.
-                        warn!("Cached credentials rejected; clearing cache");
-                        secrets::clear_cached_credentials(&self.config.uuid).await;
-                        return Err(anyhow!("CACHED_TOKEN_REJECTED"));
-                    }
-                    continue;
-                }
-
-                if auth_type.contains("Need") {
-                    // Check for web-auth URL in the message itself
-                    if let Some(url) = extract_auth_url(auth_type) {
-                        info!("Found auth URL in PASSWORD message: {}", url);
-                        self.pending_auth_url = Some(url);
-                    }
-
-                    // First time we get password request
-                    if !initial_auth_sent {
-                        // Try cached credentials first if available
-                        if let Some(ref tokens) = cached_token {
-                            if tokens.is_valid() && !used_cached_token {
-                                info!("Attempting authentication with cached token");
-                                used_cached_token = true;
-
-                                let username = self.config.username.as_deref().unwrap_or("sso");
-                                writer
-                                    .write_all(
-                                        format!("username \"Auth\" \"{}\"\n", username).as_bytes(),
-                                    )
-                                    .await?;
-                                writer
-                                    .write_all(
-                                        format!(
-                                            "password \"Auth\" \"{}\"\n",
-                                            escape_management_string(&tokens.access_token)
-                                        )
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                                writer.flush().await?;
-
-                                initial_auth_sent = true;
-                                info!("Sent cached credentials, waiting for server response...");
-                                continue;
-                            }
-                        }
-
-                        info!(
-                            "Sending initial placeholder credentials to initiate TLS handshake..."
-                        );
-
-                        // Send placeholder credentials - the server should respond with SSO challenge
-                        // Use credentials from NM config or default "oauth"
-                        let username = self.config.username.as_deref().unwrap_or("oauth");
-                        let password = self.config.password.as_deref().unwrap_or("oauth");
-
-                        writer
-                            .write_all(format!("username \"Auth\" \"{}\"\n", username).as_bytes())
-                            .await?;
-                        writer
-                            .write_all(format!("password \"Auth\" \"{}\"\n", password).as_bytes())
-                            .await?;
-                        writer.flush().await?;
-
-                        initial_auth_sent = true;
-                        info!("Sent placeholder credentials, waiting for server response...");
-
-                        // Wait for server to send SSO URL
-                        self.wait_for_sso_url(&mut reader).await;
-
-                        // If we got an auth URL, do browser auth
-                        if let Some(url) = self.pending_auth_url.clone() {
-                            info!("Got SSO URL, starting browser authentication");
-                            self.event_tx
-                                .send(VpnEvent::AuthRequired {
-                                    auth_url: Some(url.clone()),
-                                })
-                                .await
-                                .ok();
-
-                            if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
-                                error!("SSO authentication failed: {}", e);
-                                self.event_tx
-                                    .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                    .await
-                                    .ok();
-                                return Err(e);
-                            }
-                        } else {
-                            warn!("No SSO URL received from server after sending credentials");
-                            info!("Server may have accepted placeholder credentials or does not support SSO");
-                        }
-                        continue;
-                    }
-
-                    // If we already sent initial auth and get another password request,
-                    // it means the server wants SSO credentials
-                    let auth_url = self.pending_auth_url.clone();
-
-                    self.event_tx
-                        .send(VpnEvent::AuthRequired {
-                            auth_url: auth_url.clone(),
-                        })
-                        .await
-                        .ok();
-
-                    // Attempt authentication
-                    if let Err(e) = self.handle_auth(&mut writer, auth_url.as_deref()).await {
-                        error!("Authentication failed: {}", e);
-                        self.event_tx
-                            .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                            .await
-                            .ok();
-                        return Err(e);
-                    }
-                }
-            } else if line.starts_with(">STATE:") {
-                // State change
-                let parts: Vec<&str> = line.strip_prefix(">STATE:").unwrap().split(',').collect();
-
-                if parts.len() >= 2 {
-                    let state_name = parts[1];
-                    match state_name {
-                        "CONNECTING" => {
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::Connecting))
-                                .await
-                                .ok();
-                        }
-                        "WAIT" => {
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::Starting))
-                                .await
-                                .ok();
-                        }
-                        "AUTH" => {
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::NeedAuth))
-                                .await
-                                .ok();
-                        }
-                        "AUTH_PENDING" => {
-                            // AUTH_PENDING indicates the server wants external authentication
-                            // (e.g., OAuth/SSO). The OPEN_URL is in the state details.
-                            let full_state = parts[2..].join(",");
-                            info!("AUTH_PENDING state details: {}", full_state);
-
-                            if let Some(url) = extract_open_url(&full_state) {
-                                info!("Received SSO auth URL from AUTH_PENDING: {}", url);
-                                self.pending_auth_url = Some(url.clone());
-                                self.event_tx
-                                    .send(VpnEvent::AuthRequired {
-                                        auth_url: Some(url.clone()),
-                                    })
-                                    .await
-                                    .ok();
-
-                                if !self.sso_auth_initiated {
-                                    self.sso_auth_initiated = true;
-
-                                    // Detect flow type: native OpenVPN webauth vs localhost callback
-                                    let uses_localhost_callback = url
-                                        .contains("redirect_uri=http://127.0.0.1")
-                                        || url.contains("redirect_uri=http://localhost")
-                                        || url.contains("redirect_uri=https://127.0.0.1")
-                                        || url.contains("redirect_uri=https://localhost");
-
-                                    if uses_localhost_callback {
-                                        // Callback flow: start localhost server in background
-                                        let server_base = match url::Url::parse(&url) {
-                                            Ok(u) => format!(
-                                                "{}://{}:{}",
-                                                u.scheme(),
-                                                u.host_str().unwrap_or(""),
-                                                u.port().unwrap_or(9000)
-                                            ),
-                                            Err(e) => {
-                                                error!("Failed to parse auth URL: {}", e);
-                                                url.clone()
-                                            }
-                                        };
-                                        let url_clone = url.clone();
-                                        tokio::spawn(async move {
-                                            match crate::oauth::authenticate_sso(
-                                                &url_clone,
-                                                &server_base,
-                                            )
-                                            .await
-                                            {
-                                                Ok(()) => {
-                                                    info!("SSO localhost-callback flow completed")
-                                                }
-                                                Err(e) => error!(
-                                                    "SSO localhost-callback flow failed: {}",
-                                                    e
-                                                ),
-                                            }
-                                        });
-                                    } else {
-                                        // Native OpenVPN webauth: just open browser
-                                        let url_clone = url.clone();
-                                        tokio::spawn(async move {
-                                            match crate::oauth::authenticate(&url_clone, None).await
-                                            {
-                                                Ok(_) => info!("Browser opened for native webauth"),
-                                                Err(e) => error!("Failed to open browser: {}", e),
-                                            }
-                                        });
-                                    }
-                                } else {
-                                    info!("SSO auth already initiated, skipping duplicate");
-                                }
-                            } else {
-                                warn!(
-                                    "AUTH_PENDING state but no OPEN_URL found in: {}",
-                                    full_state
-                                );
-                            }
-
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::NeedAuth))
-                                .await
-                                .ok();
-                        }
-                        "GET_CONFIG" => {
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::GettingConfig))
-                                .await
-                                .ok();
-                        }
-                        "CONNECTED" => {
-                            if parts.len() >= 4 {
-                                vpn_config.local_ip = Some(parts[3].to_string());
-                            }
-                            if parts.len() >= 5 {
-                                vpn_config.remote_ip = Some(parts[4].to_string());
-                            }
-
-                            // Save credentials for future reconnections
-                            self.save_credentials_after_connect().await;
-
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::Connected))
-                                .await
-                                .ok();
-                            self.event_tx
-                                .send(VpnEvent::Connected(vpn_config.clone()))
-                                .await
-                                .ok();
-                        }
-                        "EXITING" | "RECONNECTING" => {
-                            self.event_tx
-                                .send(VpnEvent::State(VpnState::Stopping))
-                                .await
-                                .ok();
-                        }
-                        _ => {}
-                    }
-                }
-            } else if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
-                // Info message (may contain web-auth URL or auth-token)
-                let info = line
-                    .strip_prefix(">INFO:")
-                    .or_else(|| line.strip_prefix(">INFOMSG:"))
-                    .unwrap_or(line);
-                info!("Server INFO: {}", info);
-
-                // Check for auth-token (used for reconnection)
-                if let Some(token) = extract_auth_token(info) {
-                    info!("Received auth-token from server (length: {})", token.len());
-                    self.auth_token = Some(token);
-                }
-
-                // Check for auth URL
-                if let Some(url) = extract_auth_url(info) {
-                    info!("Received auth URL from server: {}", url);
-                    self.pending_auth_url = Some(url.clone());
-                    self.event_tx
-                        .send(VpnEvent::AuthRequired {
-                            auth_url: Some(url.clone()),
-                        })
-                        .await
-                        .ok();
-
-                    // If we haven't already started SSO, open browser now
-                    // This handles the case where cached token was rejected and server sends new SSO URL
-                    if !self.sso_auth_initiated {
-                        info!("Server sent SSO URL after cached token rejected, opening browser");
-                        self.sso_auth_initiated = true;
-                        if let Err(e) = crate::oauth::authenticate(&url, None).await {
-                            warn!("Failed to open browser for SSO: {}", e);
-                        }
-                    }
-                }
-            } else if line.starts_with(">BYTECOUNT:") {
-                // Byte count - connection is active
-            } else if line.starts_with("SUCCESS:") {
-                // Command succeeded
-            } else if line.starts_with("ERROR:") {
-                warn!("OpenVPN error: {}", line);
-            } else if line.starts_with(">FATAL:") {
-                let msg = line.strip_prefix(">FATAL:").unwrap_or(line);
-                error!("OpenVPN fatal error: {}", msg);
-                self.event_tx
-                    .send(VpnEvent::Failed(msg.to_string()))
-                    .await
-                    .ok();
-                return Err(anyhow!("OpenVPN fatal: {}", msg));
-            } else if line.starts_with(">LOG:") {
-                let log = line.strip_prefix(">LOG:").unwrap_or(line);
-                self.event_tx
-                    .send(VpnEvent::Log(log.to_string()))
-                    .await
-                    .ok();
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle authentication request (fallback for when no SSO URL is available)
-    async fn handle_auth(
-        &mut self,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        auth_url: Option<&str>,
-    ) -> Result<()> {
-        // First, check for cached credentials
-        if let Some(tokens) = secrets::get_cached_credentials(&self.config.uuid).await {
-            if tokens.is_valid() {
-                info!("Using cached credentials");
-                return self.send_credentials(writer, &tokens.access_token).await;
-            }
-
-            // TODO: Implement token refresh if we have a refresh token
-            if tokens.can_refresh() {
-                info!("Cached token expired, would refresh here");
-            }
-        }
-
-        // No valid cached credentials, need to do browser auth
-        info!("Starting browser authentication");
-
-        // Check if we have an auth URL
-        let url = match auth_url {
-            Some(url) => {
-                info!("Using auth URL: {}", url);
-                url
-            }
-            None => {
-                return Err(anyhow!(
-                    "Browser authentication required but no auth URL received from server. \
-                     The OpenVPN server must be configured to send a web-auth URL."
-                ));
-            }
-        };
-
-        // Perform SSO auth with the URL
-        self.handle_sso_auth(writer, url).await
-    }
-
-    /// Handle SSO/browser-based authentication
-    ///
-    /// The flow:
-    /// 1. Start a localhost HTTP server on port 19823 to receive the OAuth callback
-    /// 2. Open the browser to the VPN server's /auth/start (which redirects to Google)
-    /// 3. Google authenticates the user and redirects to localhost:19823/oauth/callback
-    /// 4. We receive the auth code and POST it to the VPN server's /auth/complete
-    /// 5. The VPN server exchanges the code for a token, verifies the user, and
-    ///    completes the VPN authentication by sending PUSH_REPLY
-    async fn handle_sso_auth(
-        &mut self,
-        _writer: &mut tokio::net::unix::OwnedWriteHalf,
-        auth_url: &str,
-    ) -> Result<()> {
-        // Prevent duplicate browser launches
-        if self.sso_auth_initiated {
-            info!("SSO auth already initiated, skipping duplicate browser open");
-            return Ok(());
-        }
-
-        info!("Starting SSO authentication with URL: {}", auth_url);
-        self.sso_auth_initiated = true;
-
-        use crate::oauth;
-
-        // Detect which SSO flow the server uses:
-        // - Native OpenVPN webauth: URL has no localhost redirect_uri;
-        //   server completes auth through the VPN tunnel. Just open browser.
-        // - Callback flow: URL contains redirect_uri=127.0.0.1 or localhost;
-        //   we must start a localhost HTTP server to receive the code.
-        let uses_localhost_callback = auth_url.contains("redirect_uri=http://127.0.0.1")
-            || auth_url.contains("redirect_uri=http://localhost")
-            || auth_url.contains("redirect_uri=https://127.0.0.1")
-            || auth_url.contains("redirect_uri=https://localhost");
-
-        if uses_localhost_callback {
-            info!("Detected localhost-callback SSO flow");
-            let server_base_url = match url::Url::parse(auth_url) {
-                Ok(u) => format!(
-                    "{}://{}:{}",
-                    u.scheme(),
-                    u.host_str().unwrap_or(""),
-                    u.port().unwrap_or(9000)
-                ),
+        if let Some(mut child) = self.process.take() {
+            match tokio::time::timeout(OPENVPN_EXIT_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => info!("OpenVPN exited: {status}"),
+                Ok(Err(e)) => warn!("Failed to wait for OpenVPN: {e}"),
                 Err(_) => {
-                    self.sso_auth_initiated = false;
-                    return Err(anyhow!("Invalid auth URL: {}", auth_url));
-                }
-            };
-            match oauth::authenticate_sso(auth_url, &server_base_url).await {
-                Ok(()) => {
-                    info!("SSO localhost-callback flow completed");
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("SSO localhost-callback flow failed: {}", e);
-                    self.sso_auth_initiated = false;
-                    Err(anyhow!("SSO authentication failed: {}", e))
-                }
-            }
-        } else {
-            info!("Detected native OpenVPN webauth flow (no localhost callback)");
-            // For native OpenVPN webauth, just open the browser. The server
-            // will complete authentication through the VPN tunnel (AUTH_PENDING).
-            match oauth::authenticate(auth_url, None).await {
-                Ok(_) => {
-                    info!("Browser opened for native webauth; waiting for server to complete auth via tunnel");
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("Failed to open browser for webauth: {}", e);
-                    self.sso_auth_initiated = false;
-                    Err(anyhow!("Browser open failed: {}", e))
+                    warn!("OpenVPN did not exit within {OPENVPN_EXIT_TIMEOUT:?}, killing it");
+                    let _ = child.kill().await;
                 }
             }
         }
+        self.remove_runtime_files();
     }
 
-    /// Send credentials to OpenVPN via management interface
-    async fn send_credentials(
-        &self,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        token: &str,
-    ) -> Result<()> {
-        // Send username (often ignored for SSO)
-        writer.write_all(b"username \"Auth\" \"sso\"\n").await?;
-
-        // Send the token as the password
-        let password_cmd = format!(
-            "password \"Auth\" \"{}\"\n",
-            escape_management_string(token)
-        );
-        writer.write_all(password_cmd.as_bytes()).await?;
-
-        info!("Sent SSO credentials to OpenVPN");
-        Ok(())
-    }
-
-    /// Disconnect the VPN
-    pub async fn disconnect(&mut self) -> Result<()> {
-        if let Some(ref mut child) = self.process {
-            info!("Stopping OpenVPN process");
-
-            // Try graceful shutdown via management interface first
-            if let Ok(stream) = UnixStream::connect(&self.socket_path).await {
-                let (_, mut writer) = stream.into_split();
-                let _ = writer.write_all(b"signal SIGTERM\n").await;
-
-                // Give it a moment to shut down gracefully
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-
-            // Force kill if still running
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-
-            self.process = None;
-        }
-
-        // Clean up socket
-        let _ = tokio::fs::remove_file(&self.socket_path).await;
-
-        // Clean up temp config file if we created one
-        if let Some(ref temp_config) = self.temp_config_path {
-            let _ = tokio::fs::remove_file(temp_config).await;
-            self.temp_config_path = None;
-        }
-
-        self.event_tx
-            .send(VpnEvent::State(VpnState::Stopped))
-            .await
-            .ok();
-
-        Ok(())
-    }
-
-    /// Check if process is still running
-    #[allow(dead_code)]
-    pub fn is_running(&mut self) -> bool {
-        if let Some(ref mut child) = self.process {
-            match child.try_wait() {
-                Ok(None) => true, // Still running
-                _ => false,
-            }
-        } else {
-            false
+    fn remove_runtime_files(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(temp_config) = self.temp_config_path.take() {
+            let _ = std::fs::remove_file(temp_config);
         }
     }
-
-    /// Save credentials after successful connection for future reconnections
-    async fn save_credentials_after_connect(&self) {
-        info!(
-            "save_credentials_after_connect called, auth_token={:?}, pending_auth_url={:?}",
-            self.auth_token
-                .as_ref()
-                .map(|t| format!("{}...", &t[..t.len().min(20)])),
-            self.pending_auth_url.is_some()
-        );
-        // Prefer auth_token if we received one from the server
-        let token_to_save = if let Some(ref token) = self.auth_token {
-            info!("Saving auth-token received from server");
-            Some(token.clone())
-        } else if let Some(ref url) = self.pending_auth_url {
-            // If we did browser auth, create a marker token indicating successful SSO
-            // The actual session is maintained server-side, but we track that auth was done
-            info!("Saving SSO session marker for URL: {}", url);
-            // Use a hash of the URL as a session identifier
-            Some(format!("sso-session:{}", url))
-        } else {
-            None
-        };
-
-        if let Some(token) = token_to_save {
-            let tokens = secrets::StoredTokens {
-                access_token: token,
-                refresh_token: None,
-                // Auth tokens from OpenVPN servers typically last 24-48 hours
-                // Set expiry to 24 hours from now
-                expires_at: Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64 + 86400) // 24 hours
-                        .unwrap_or(0),
-                ),
-            };
-
-            match secrets::cache_credentials(&self.config.uuid, tokens).await {
-                Ok(()) => info!(
-                    "Successfully cached credentials for connection {}",
-                    self.config.uuid
-                ),
-                Err(e) => warn!("Failed to cache credentials: {}", e),
-            }
-        } else {
-            info!("No credentials to cache after connection");
-        }
-    }
-}
-
-/// Extract auth-token from OpenVPN server messages
-/// Auth tokens can be sent via various formats:
-/// - AUTH_TOKEN:token_value
-/// - auth-token,token_value
-/// - push-reply with auth-token
-fn extract_auth_token(message: &str) -> Option<String> {
-    // Pattern 1: AUTH_TOKEN:value or AUTH-TOKEN:value
-    if let Some(pos) = message.to_uppercase().find("AUTH_TOKEN:") {
-        let start = pos + "AUTH_TOKEN:".len();
-        let token = message[start..]
-            .split_whitespace()
-            .next()
-            .map(|s| s.trim_matches(|c| c == '"' || c == '\'' || c == ','));
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    // Pattern 2: auth-token,value (OpenVPN PUSH format)
-    if let Some(pos) = message.find("auth-token,") {
-        let start = pos + "auth-token,".len();
-        let token = message[start..]
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .next()
-            .map(|s| s.trim_matches(|c| c == '"' || c == '\''));
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    // Pattern 3: CR_RESPONSE with session token
-    if message.starts_with("CR_RESPONSE:") {
-        let token = message.strip_prefix("CR_RESPONSE:").map(|s| s.trim());
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract OPEN_URL from an OpenVPN AUTH_PENDING state message.
-/// The state details may look like: "timeout 120,OPEN_URL:http://host:port/path?query"
-fn extract_open_url(message: &str) -> Option<String> {
-    if let Some(pos) = message.find("OPEN_URL:") {
-        let url_start = pos + "OPEN_URL:".len();
-        // URL ends at comma, whitespace, or end of string
-        let url_end = message[url_start..]
-            .find(|c: char| c == ',' || c.is_whitespace())
-            .map(|i| url_start + i)
-            .unwrap_or(message.len());
-        let url = &message[url_start..url_end];
-        if !url.is_empty() {
-            return Some(url.to_string());
-        }
-    }
-    None
-}
-
-/// Extract auth URL from OpenVPN message
-fn extract_auth_url(message: &str) -> Option<String> {
-    // Look for common patterns in web-auth messages
-    // Pattern 1: WEB_AUTH:flags:url  (e.g. WEB_AUTH:hidden:https://...)
-    // The URL is always the last field after the final colon before http/https.
-    if let Some(start) = message.find("WEB_AUTH:") {
-        let after_prefix = &message[start + "WEB_AUTH:".len()..];
-        // Find the start of the actual URL (http:// or https://)
-        if let Some(url_start_rel) = after_prefix
-            .find("http://")
-            .or_else(|| after_prefix.find("https://"))
-        {
-            let url_start = start + "WEB_AUTH:".len() + url_start_rel;
-            let url_end = message[url_start..]
-                .find(|c: char| c.is_whitespace())
-                .map(|i| url_start + i)
-                .unwrap_or(message.len());
-            return Some(message[url_start..url_end].to_string());
-        }
-    }
-
-    // Pattern 1b: OPEN_URL:http://... (from AUTH_PENDING state or control message)
-    if let Some(url) = extract_open_url(message) {
-        return Some(url);
-    }
-
-    // Pattern 2: fallback - any http/https URL in the message
-    if message.contains("http://") || message.contains("https://") {
-        for word in message.split_whitespace() {
-            if word.starts_with("http://") || word.starts_with("https://") {
-                return Some(word.trim_matches(|c| c == '"' || c == '\'').to_string());
-            }
-        }
-    }
-
-    // Pattern 3: CRV1 challenge (base64 encoded)
-    if message.starts_with("CRV1:") {
-        // Decode and parse CRV1 challenge
-        // Format: CRV1:flags:state_id:username:challenge_text
-        let parts: Vec<&str> = message.splitn(5, ':').collect();
-        if parts.len() >= 5 {
-            let challenge = parts[4];
-            // Challenge text might contain the URL
-            if challenge.contains("http") {
-                for word in challenge.split_whitespace() {
-                    if word.starts_with("http://") || word.starts_with("https://") {
-                        return Some(word.trim_matches(|c| c == '"' || c == '\'').to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Escape special characters for the management interface
-fn escape_management_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 impl Drop for OpenVpnManager {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.process {
-            // Best effort cleanup
-            let _ = child.start_kill();
+        // Reached without shutdown() only when the task is aborted. The child
+        // was spawned with kill_on_drop, so dropping it kills OpenVPN.
+        if let Some(task) = self.sso_task.take() {
+            task.abort();
         }
-        // Clean up socket
-        let _ = std::fs::remove_file(&self.socket_path);
-        // Clean up temp config file
-        if let Some(ref temp_config) = self.temp_config_path {
-            let _ = std::fs::remove_file(temp_config);
+        self.remove_runtime_files();
+    }
+}
+
+/// Log every line of an OpenVPN output stream until it closes
+fn forward_output(stream: impl AsyncRead + Unpin + Send + 'static) {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stream);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    info!(target: "openvpn", "openvpn: {}", redact_secrets(line.trim_end()));
+                }
+                Err(e) => {
+                    warn!("Failed to read OpenVPN output: {e}");
+                    break;
+                }
+            }
         }
+    });
+}
+
+/// Kill openvpn processes left over from an earlier run on our socket
+async fn kill_stale_openvpn_processes(socket_path: &Path) {
+    let pattern = format!("openvpn.*{}", socket_path.display());
+    if let Ok(output) = Command::new("pkill").args(["-f", &pattern]).output().await {
+        if output.status.success() {
+            info!(
+                "Killed stale openvpn processes using {}",
+                socket_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+async fn ensure_runtime_dir() {
+    let dir = Path::new(RUNTIME_DIR);
+    if dir.exists() {
+        return;
+    }
+    info!("Creating runtime directory: {RUNTIME_DIR}");
+    match tokio::fs::create_dir_all(dir).await {
+        Ok(()) => {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+        }
+        Err(e) => warn!("Failed to create runtime directory {RUNTIME_DIR}: {e}"),
+    }
+}
+
+/// Write a root-only file without following a pre-planted symlink
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+/// Remove management directives from an .ovpn file. Returns None when
+/// there is nothing to remove.
+fn strip_management_directives(contents: &str) -> Option<String> {
+    let is_management = |line: &&str| line.trim_start().starts_with("management");
+    if !contents.lines().any(|line| is_management(&line)) {
+        return None;
+    }
+    Some(
+        contents
+            .lines()
+            .filter(|line| !is_management(line))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+async fn cache_token(connection_uuid: &str, token: String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tokens = secrets::StoredTokens {
+        access_token: token,
+        refresh_token: None,
+        expires_at: Some(now + CACHED_TOKEN_TTL_SECS),
+    };
+    if let Err(e) = secrets::cache_credentials(connection_uuid, tokens).await {
+        warn!("Failed to cache auth-token: {e:#}");
+    }
+}
+
+/// Build the tunnel description for NetworkManager. OpenVPN has already
+/// configured the interface, so the kernel is the source of truth for the
+/// device name and prefix length.
+async fn describe_tunnel(local_ip: Option<Ipv4Addr>, remote_ip: Option<Ipv4Addr>) -> VpnConfig {
+    let mut config = VpnConfig {
+        local_ip,
+        remote_ip,
+        ..Default::default()
+    };
+    let Some(ip) = local_ip else {
+        return config;
+    };
+
+    match Command::new("ip")
+        .args(["-j", "-4", "addr", "show"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            match find_interface_with_address(&output.stdout, ip) {
+                Some(iface) => {
+                    config.tun_device = Some(iface.name);
+                    config.prefix = Some(iface.prefix);
+                    config.peer_ip = iface.peer;
+                }
+                None => warn!("No network interface carries the tunnel address {ip}"),
+            }
+        }
+        Ok(output) => warn!("`ip addr` failed with {}", output.status),
+        Err(e) => warn!("Failed to run `ip addr`: {e}"),
+    }
+    config
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TunnelInterface {
+    name: String,
+    prefix: u8,
+    peer: Option<Ipv4Addr>,
+}
+
+/// Find the interface holding `ip` in `ip -j -4 addr show` output
+fn find_interface_with_address(json: &[u8], ip: Ipv4Addr) -> Option<TunnelInterface> {
+    #[derive(Deserialize)]
+    struct Link {
+        ifname: String,
+        #[serde(default)]
+        addr_info: Vec<AddrInfo>,
+    }
+    #[derive(Deserialize)]
+    struct AddrInfo {
+        local: Option<String>,
+        prefixlen: Option<u8>,
+        /// Peer address on point-to-point links
+        address: Option<String>,
+    }
+
+    let links: Vec<Link> = serde_json::from_slice(json).ok()?;
+    links.into_iter().find_map(|link| {
+        let addr = link
+            .addr_info
+            .iter()
+            .find(|a| a.local.as_deref().and_then(|s| s.parse().ok()) == Some(ip))?;
+        Some(TunnelInterface {
+            prefix: addr.prefixlen.unwrap_or(32),
+            peer: addr.address.as_deref().and_then(|s| s.parse().ok()),
+            name: link.ifname,
+        })
+    })
+}
+
+/// Extract OPEN_URL from an OpenVPN message, e.g. the AUTH_PENDING state
+/// details "timeout 120,OPEN_URL:http://host:port/path?query"
+fn extract_open_url(message: &str) -> Option<String> {
+    let start = message.find("OPEN_URL:")? + "OPEN_URL:".len();
+    let rest = &message[start..];
+    let end = rest
+        .find(|c: char| c == ',' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let url = &rest[..end];
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+/// Extract an SSO URL from an OpenVPN message
+fn extract_auth_url(message: &str) -> Option<String> {
+    // WEB_AUTH:flags:url (e.g. WEB_AUTH::https://... or WEB_AUTH:hidden:https://...)
+    if let Some(start) = message.find("WEB_AUTH:") {
+        let after = &message[start + "WEB_AUTH:".len()..];
+        if let Some(url_start) = after.find("http://").or_else(|| after.find("https://")) {
+            let url = &after[url_start..];
+            let end = url.find(char::is_whitespace).unwrap_or(url.len());
+            return Some(url[..end].to_string());
+        }
+    }
+
+    // OPEN_URL:http://... (AUTH_PENDING state or control message)
+    if let Some(url) = extract_open_url(message) {
+        return Some(url);
+    }
+
+    // Fallback: any http(s) URL in the message (also covers CRV1 challenge text)
+    message
+        .split_whitespace()
+        .find(|word| word.starts_with("http://") || word.starts_with("https://"))
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_string())
+}
+
+/// Hide auth-token values before a line is logged. Matches both the
+/// management notification (">PASSWORD:Auth-Token:<token>") and pushed
+/// options ("auth-token <token>", "auth-token-user <user>").
+fn redact_secrets(line: &str) -> String {
+    const MARKER: &str = "auth-token";
+    // ASCII lowercasing keeps byte offsets identical to `line`
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut pos = 0;
+
+    while let Some(found) = lower[pos..].find(MARKER) {
+        let after_marker = pos + found + MARKER.len();
+        // Optional suffix such as "-user"
+        let suffix_len = line[after_marker..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(line.len() - after_marker);
+        let after_suffix = after_marker + suffix_len;
+        let sep_len = line[after_suffix..]
+            .find(|c: char| !matches!(c, ':' | ' ' | '='))
+            .unwrap_or(line.len() - after_suffix);
+        if sep_len == 0 {
+            // Mentions the option without a value, e.g. "(auth-token)"
+            out.push_str(&line[pos..after_suffix]);
+            pos = after_suffix;
+            continue;
+        }
+        let value_start = after_suffix + sep_len;
+        let value_len = line[value_start..]
+            .find(|c: char| c == ',' || c == '\'' || c == '"' || c.is_whitespace())
+            .unwrap_or(line.len() - value_start);
+        out.push_str(&line[pos..value_start]);
+        if value_len > 0 {
+            out.push_str("<redacted>");
+        }
+        pos = value_start + value_len;
+    }
+    out.push_str(&line[pos..]);
+    out
+}
+
+/// Escape a value for a double-quoted management interface argument
+fn escape_management_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send(cmd: &str) -> Action {
+        Action::Send(cmd.to_string())
+    }
+
+    fn state(s: VpnState) -> Action {
+        Action::Emit(VpnEvent::State(s))
+    }
+
+    fn placeholder_credentials() -> Vec<Action> {
+        vec![
+            send("username \"Auth\" \"oauth\"\n"),
+            send("password \"Auth\" \"oauth\"\n"),
+        ]
+    }
+
+    /// Feed lines and collect every action they produce
+    fn feed(protocol: &mut Protocol, lines: &[&str]) -> Vec<Action> {
+        lines
+            .iter()
+            .flat_map(|line| protocol.handle_line(line))
+            .collect()
+    }
+
+    /// Replays a journal transcript of the reported bug: about 55 minutes
+    /// after connecting, renegotiation fails because the server rejects the
+    /// auth-token. OpenVPN restarts and waits in a management hold; the old
+    /// code never released it and refused to re-open the browser.
+    #[test]
+    fn reauthenticates_after_auth_token_is_rejected() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+
+        assert_eq!(
+            feed(
+                &mut p,
+                &[">INFO:OpenVPN Management Interface Version 6 -- type 'help' for more info"]
+            ),
+            vec![]
+        );
+        assert_eq!(
+            feed(&mut p, &[">HOLD:Waiting for hold release:0"]),
+            vec![send("hold release\n")]
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    "SUCCESS: real-time state notification set to ON",
+                    "SUCCESS: hold release succeeded",
+                    ">PASSWORD:Need 'Auth' username/password",
+                ]
+            ),
+            placeholder_credentials()
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    "SUCCESS: 'Auth' username entered, but not yet verified",
+                    ">STATE:1794299884,RESOLVE,,,,,,",
+                    ">STATE:1794299884,AUTH,,,,,,",
+                    ">STATE:1794299885,AUTH_PENDING,timeout 180,,,,,",
+                    ">INFOMSG:WEB_AUTH::https://vpn.example.com:9000/oauth2/start?state=first",
+                ]
+            ),
+            vec![
+                state(VpnState::Connecting),
+                state(VpnState::Authenticating),
+                state(VpnState::Authenticating),
+                Action::OpenBrowser("https://vpn.example.com:9000/oauth2/start?state=first".into()),
+            ]
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">STATE:1794299886,GET_CONFIG,,,,,,",
+                    ">PASSWORD:Auth-Token:SESS_ID_AT_token1",
+                    ">STATE:1794299887,CONNECTED,SUCCESS,10.8.0.5,52.19.23.151,1194,,,fe80::1",
+                ]
+            ),
+            vec![
+                state(VpnState::GettingConfig),
+                Action::CacheToken("SESS_ID_AT_token1".into()),
+                Action::Connected {
+                    local_ip: Some(Ipv4Addr::new(10, 8, 0, 5)),
+                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151)),
+                },
+            ]
+        );
+
+        // ~55 minutes later: renegotiation with the auth-token fails
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">PASSWORD:Verification Failed: 'Auth'",
+                    ">STATE:1794303150,RECONNECTING,auth-failure (auth-token),,,,,",
+                ]
+            ),
+            vec![Action::ClearCachedToken, state(VpnState::Reconnecting)]
+        );
+        assert_eq!(
+            feed(&mut p, &[">HOLD:Waiting for hold release:2"]),
+            vec![send("hold release\n")]
+        );
+        assert_eq!(
+            feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
+            placeholder_credentials()
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">STATE:1794303151,AUTH_PENDING,timeout 180,,,,,",
+                    ">INFOMSG:WEB_AUTH::https://vpn.example.com:9000/oauth2/start?state=second",
+                    ">STATE:1794303160,CONNECTED,SUCCESS,10.8.0.6,52.19.23.151,1194,,,",
+                ]
+            ),
+            vec![
+                state(VpnState::Authenticating),
+                Action::OpenBrowser(
+                    "https://vpn.example.com:9000/oauth2/start?state=second".into()
+                ),
+                Action::Connected {
+                    local_ip: Some(Ipv4Addr::new(10, 8, 0, 6)),
+                    remote_ip: Some(Ipv4Addr::new(52, 19, 23, 151)),
+                },
+            ]
+        );
+        // Token rejection during renegotiation is not counted as an SSO failure
+        assert_eq!(p.sso_failures, 0);
+    }
+
+    #[test]
+    fn falls_back_to_sso_when_cached_token_is_rejected() {
+        let mut p = Protocol::new("oauth", "oauth", Some("SESS_ID_AT_old".into()));
+
+        assert_eq!(
+            feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
+            vec![
+                send("username \"Auth\" \"oauth\"\n"),
+                send("password \"Auth\" \"SESS_ID_AT_old\"\n"),
+            ]
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">PASSWORD:Verification Failed: 'Auth'",
+                    ">STATE:1,RECONNECTING,auth-failure,,,,,",
+                    ">HOLD:Waiting for hold release:2",
+                    ">PASSWORD:Need 'Auth' username/password",
+                ]
+            ),
+            [
+                vec![
+                    Action::ClearCachedToken,
+                    state(VpnState::Reconnecting),
+                    send("hold release\n"),
+                ],
+                placeholder_credentials(),
+            ]
+            .concat()
+        );
+        assert_eq!(p.sso_failures, 0);
+    }
+
+    #[test]
+    fn gives_up_after_repeated_sso_failures() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        for round in 0..MAX_SSO_FAILURES {
+            assert_eq!(
+                feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
+                placeholder_credentials(),
+                "round {round}"
+            );
+            feed(&mut p, &[">PASSWORD:Verification Failed: 'Auth'"]);
+        }
+        assert_eq!(
+            feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
+            vec![Action::Fail {
+                reason: format!("SSO authentication failed {MAX_SSO_FAILURES} times in a row"),
+                kind: FailureKind::Login,
+            }]
+        );
+    }
+
+    #[test]
+    fn successful_connection_resets_sso_failure_count() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        feed(
+            &mut p,
+            &[
+                ">PASSWORD:Need 'Auth' username/password",
+                ">PASSWORD:Verification Failed: 'Auth'",
+                ">PASSWORD:Need 'Auth' username/password",
+                ">STATE:1,CONNECTED,SUCCESS,10.8.0.5,1.2.3.4,1194,,,",
+            ],
+        );
+        assert_eq!(p.sso_failures, 0);
+    }
+
+    #[test]
+    fn opens_each_sso_url_once_per_round() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]);
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">STATE:1,AUTH_PENDING,timeout 120,OPEN_URL:https://sso.example.com/start?x=1,,,",
+                    ">INFOMSG:OPEN_URL:https://sso.example.com/start?x=1",
+                ]
+            ),
+            vec![
+                Action::OpenBrowser("https://sso.example.com/start?x=1".into()),
+                state(VpnState::Authenticating),
+            ]
+        );
+
+        // A new credential request starts a new round: same URL opens again
+        feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]);
+        assert_eq!(
+            feed(
+                &mut p,
+                &[">INFOMSG:OPEN_URL:https://sso.example.com/start?x=1"]
+            ),
+            vec![Action::OpenBrowser(
+                "https://sso.example.com/start?x=1".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn fatal_error_fails_the_connection() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        assert_eq!(
+            feed(&mut p, &[">FATAL:Cannot open TUN/TAP dev"]),
+            vec![Action::Fail {
+                reason: "OpenVPN fatal error: Cannot open TUN/TAP dev".into(),
+                kind: FailureKind::Connect,
+            }]
+        );
+    }
+
+    #[test]
+    fn escapes_credentials() {
+        let mut p = Protocol::new("us\"er", "pa\\ss\nword", None);
+        assert_eq!(
+            feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
+            vec![
+                send("username \"Auth\" \"us\\\"er\"\n"),
+                send("password \"Auth\" \"pa\\\\ssword\"\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_auth_urls() {
+        assert_eq!(
+            extract_auth_url("WEB_AUTH::https://vpn.example.com:9000/oauth2/start?state=abc"),
+            Some("https://vpn.example.com:9000/oauth2/start?state=abc".into())
+        );
+        assert_eq!(
+            extract_auth_url("WEB_AUTH:hidden:https://sso.example.com/a b"),
+            Some("https://sso.example.com/a".into())
+        );
+        assert_eq!(
+            extract_auth_url("timeout 120,OPEN_URL:http://10.0.0.1:9000/start?a=1,x"),
+            Some("http://10.0.0.1:9000/start?a=1".into())
+        );
+        assert_eq!(
+            extract_auth_url("OpenVPN Management Interface Version 6 -- type 'help'"),
+            None
+        );
+    }
+
+    #[test]
+    fn redacts_auth_tokens() {
+        assert_eq!(
+            redact_secrets(">PASSWORD:Auth-Token:SESS_ID_AT_abc/def=="),
+            ">PASSWORD:Auth-Token:<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("PUSH_REPLY,route-gateway 10.8.0.1,auth-token SESS_ID_AT_x,peer-id 0"),
+            "PUSH_REPLY,route-gateway 10.8.0.1,auth-token <redacted>,peer-id 0"
+        );
+        assert_eq!(
+            redact_secrets("auth-token-user dXNlcg==,ping 10"),
+            "auth-token-user <redacted>,ping 10"
+        );
+        assert_eq!(
+            redact_secrets(">STATE:1,RECONNECTING,auth-failure (auth-token),,,,,"),
+            ">STATE:1,RECONNECTING,auth-failure (auth-token),,,,,"
+        );
+        assert_eq!(redact_secrets("nothing to see"), "nothing to see");
+    }
+
+    #[test]
+    fn finds_tunnel_interface_in_ip_json() {
+        let json = br#"[
+            {"ifindex":1,"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},
+            {"ifindex":2,"ifname":"wlo1","addr_info":[]},
+            {"ifindex":3,"ifname":"eth0","addr_info":[{},{}]},
+            {"ifindex":4,"ifname":"tun0","addr_info":[
+                {"family":"inet","local":"10.8.0.8","prefixlen":24,"broadcast":"10.8.0.255"},
+                {"family":"inet","local":"8.0.8.10","prefixlen":24}
+            ]},
+            {"ifindex":5,"ifname":"tun1","addr_info":[
+                {"family":"inet","local":"10.9.0.6","address":"10.9.0.5","prefixlen":32}
+            ]}
+        ]"#;
+        assert_eq!(
+            find_interface_with_address(json, Ipv4Addr::new(10, 8, 0, 8)),
+            Some(TunnelInterface {
+                name: "tun0".into(),
+                prefix: 24,
+                peer: None
+            })
+        );
+        assert_eq!(
+            find_interface_with_address(json, Ipv4Addr::new(10, 9, 0, 6)),
+            Some(TunnelInterface {
+                name: "tun1".into(),
+                prefix: 32,
+                peer: Some(Ipv4Addr::new(10, 9, 0, 5))
+            })
+        );
+        assert_eq!(
+            find_interface_with_address(json, Ipv4Addr::new(10, 1, 1, 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn strips_management_directives_only_when_present() {
+        assert_eq!(strip_management_directives("client\nremote x 1194\n"), None);
+        assert_eq!(
+            strip_management_directives(
+                "client\nmanagement 127.0.0.1 7505\n  management-hold\nverb 3"
+            ),
+            Some("client\nverb 3".into())
+        );
     }
 }

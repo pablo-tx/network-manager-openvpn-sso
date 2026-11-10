@@ -169,10 +169,30 @@ If "Stopping OpenVPN process" is missing, the `OpenVpnManager` was inaccessible 
 
 ### Connection times out
 
+NetworkManager gives a VPN 60 seconds to connect by default, which is often
+less than an interactive SSO login needs (many servers allow 180 seconds for
+`AUTH_PENDING`). Raise the timeout on the connection:
+
+```bash
+nmcli connection modify "connection-name" vpn.timeout 180
+```
+
+Then watch the logs:
+
 ```bash
 journalctl -u NetworkManager -f
 journalctl --user -u openvpn-sso-browser.service -f
 ```
+
+### Browser opens again about once an hour
+
+The server rejected the session's auth-token during TLS renegotiation
+(`RECONNECTING,auth-failure (auth-token)` in the log). The plugin
+re-authenticates automatically: it opens the SSO URL again and, if your
+identity provider session is still valid, the login completes without
+interaction. To avoid the re-authentication entirely, the server must accept
+auth-token renewal for longer than `reneg-sec` (see `auth-gen-token` in
+openvpn(8), or your SSO backend's session refresh option).
 
 ## How It Works
 
@@ -186,6 +206,20 @@ journalctl --user -u openvpn-sso-browser.service -f
    - **Callback flow** (redirect_uri=localhost): Starts a localhost HTTP server, opens browser to auth URL, receives the OAuth callback, POSTs the code to the VPN server
    - **Native webauth** (no localhost redirect): Just opens the browser; the server completes authentication through the VPN tunnel
 8. After successful authentication, the server provides credentials and the plugin completes the VPN connection
+
+### Reconnect Flow
+
+OpenVPN restarts the tunnel by itself (ping timeout, network change, rejected
+auth-token). The plugin reports this to NetworkManager as a reconnect, so the
+connection stays up in NetworkManager while OpenVPN re-establishes it:
+
+1. OpenVPN reports `RECONNECTING`; the plugin tells NetworkManager it is starting again
+2. The plugin releases OpenVPN's management hold and answers its credential request
+3. If the server asks for SSO again, the browser opens with the new URL
+4. On `CONNECTED`, the plugin sends the new IP configuration to NetworkManager
+
+If three SSO attempts in a row fail (for example, nobody completes the login),
+the plugin stops and NetworkManager marks the connection as failed.
 
 ### Disconnect Flow
 

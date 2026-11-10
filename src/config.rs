@@ -7,7 +7,8 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use zbus::zvariant::OwnedValue;
+use tracing::debug;
+use zbus::zvariant::{OwnedValue, Value};
 
 /// VPN connection settings extracted from NetworkManager
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +83,7 @@ impl ConnectionConfig {
             .ok_or_else(|| anyhow!("Missing 'vpn' settings section"))?;
 
         // Get VPN data (nested dict)
-        let vpn_data = get_string_dict(vpn, "data").unwrap_or_default();
+        let vpn_data = get_string_dict(vpn, "data");
 
         let config_path = vpn_data.get("config").map(PathBuf::from);
 
@@ -116,7 +117,7 @@ impl ConnectionConfig {
         let username = vpn_data.get("username").cloned();
 
         // Get secrets section for password
-        let vpn_secrets = get_string_dict(vpn, "secrets").unwrap_or_default();
+        let vpn_secrets = get_string_dict(vpn, "secrets");
         let password = vpn_secrets.get("password").cloned();
 
         Ok(Self {
@@ -145,6 +146,18 @@ impl ConnectionConfig {
             verify_x509_name,
             challenge_response_flags,
         })
+    }
+
+    /// Username sent with placeholder credentials and with cached tokens.
+    /// Both must use the same value: OpenVPN auth-tokens are bound to the
+    /// username they were issued for.
+    pub fn auth_username(&self) -> &str {
+        self.username.as_deref().unwrap_or("oauth")
+    }
+
+    /// Placeholder password sent to start the SSO exchange
+    pub fn auth_password(&self) -> &str {
+        self.password.as_deref().unwrap_or("oauth")
     }
 
     /// Build OpenVPN command line arguments
@@ -242,6 +255,12 @@ impl ConnectionConfig {
         // OpenVPN will query the management interface for credentials.
         args.push("--auth-user-pass".to_string());
 
+        // On an authentication failure (expired auth-token, rejected cached
+        // token, SSO timeout) restart and ask the management interface for
+        // credentials again instead of exiting. This is what lets a session
+        // re-authenticate without tearing the tunnel down.
+        args.extend(["--auth-retry".to_string(), "interact".to_string()]);
+
         // Common: management interface
         args.extend([
             "--management".to_string(),
@@ -278,77 +297,103 @@ impl ConnectionConfig {
 }
 
 fn get_string(dict: &HashMap<String, OwnedValue>, key: &str) -> Result<String> {
-    dict.get(key)
-        .ok_or_else(|| anyhow!("Missing key: {}", key))
-        .and_then(|v| {
-            // Try to extract string from the variant value
-            // zvariant stores strings as Str or String types
-            let s = v.to_string();
-            // Remove quotes if present (zvariant's Display adds them)
-            let trimmed = s.trim_matches('"');
-            if !trimmed.is_empty() {
-                Ok(trimmed.to_string())
-            } else {
-                Err(anyhow!("Key {} is not a string or is empty", key))
-            }
-        })
+    let value = dict
+        .get(key)
+        .ok_or_else(|| anyhow!("Missing key: {}", key))?;
+    match value_as_str(value) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        Some(_) => Err(anyhow!("Key {} is empty", key)),
+        None => Err(anyhow!("Key {} is not a string", key)),
+    }
 }
 
-fn get_string_dict(
-    dict: &HashMap<String, OwnedValue>,
-    key: &str,
-) -> Option<HashMap<String, String>> {
-    use tracing::info;
-    use zbus::zvariant::Value;
+/// Read a D-Bus string, looking through a variant wrapper if present
+fn value_as_str<'a>(value: &'a Value<'_>) -> Option<&'a str> {
+    match value {
+        Value::Str(s) => Some(s.as_str()),
+        Value::Value(inner) => value_as_str(inner),
+        _ => None,
+    }
+}
 
-    dict.get(key).and_then(|v| {
-        let mut result = HashMap::new();
+/// Read an `a{ss}` entry such as vpn.data or vpn.secrets. Values are never
+/// logged: vpn.secrets holds passwords.
+fn get_string_dict(dict: &HashMap<String, OwnedValue>, key: &str) -> HashMap<String, String> {
+    let Some(Value::Dict(entries)) = dict.get(key).map(|v| &**v) else {
+        return HashMap::new();
+    };
+    let result: HashMap<String, String> = entries
+        .iter()
+        .filter_map(|(k, v)| Some((value_as_str(k)?.to_string(), value_as_str(v)?.to_string())))
+        .collect();
+    debug!("vpn.{} keys: {:?}", key, result.keys().collect::<Vec<_>>());
+    result
+}
 
-        // Log the raw value for debugging
-        info!(
-            "Parsing vpn.data key '{}', raw value type: {:?}",
-            key,
-            v.value_signature()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owned(value: Value<'_>) -> OwnedValue {
+        value.try_into().unwrap()
+    }
+
+    fn string_map(pairs: &[(&str, &str)]) -> OwnedValue {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        owned(Value::from(map))
+    }
+
+    /// Settings shaped like NetworkManager's a{sa{sv}} Connect() argument
+    fn nm_settings(data: &[(&str, &str)]) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let connection = HashMap::from([
+            ("uuid".to_string(), owned(Value::from("a815ec0b-0000"))),
+            ("id".to_string(), owned(Value::from("corp \"prod\""))),
+        ]);
+        let vpn = HashMap::from([
+            ("data".to_string(), string_map(data)),
+            ("secrets".to_string(), string_map(&[])),
+        ]);
+        HashMap::from([
+            ("connection".to_string(), connection),
+            ("vpn".to_string(), vpn),
+        ])
+    }
+
+    #[test]
+    fn parses_nm_settings() {
+        let config =
+            ConnectionConfig::from_nm_settings(&nm_settings(&[("config", "/etc/vpn/prod.ovpn")]))
+                .unwrap();
+        assert_eq!(config.uuid, "a815ec0b-0000");
+        // Quotes in values survive (the old Display-based parsing stripped them)
+        assert_eq!(config.id, "corp \"prod\"");
+        assert_eq!(
+            config.config_path,
+            Some(PathBuf::from("/etc/vpn/prod.ovpn"))
         );
+        assert_eq!(config.auth_username(), "oauth");
+        assert_eq!(config.auth_password(), "oauth");
+    }
 
-        // Try to access as Dict<String, String> using Value
-        let value: Value = v.clone().into();
-        info!("Converted to Value variant: {:?}", value);
+    #[test]
+    fn requires_config_file_or_ca() {
+        assert!(ConnectionConfig::from_nm_settings(&nm_settings(&[])).is_err());
+    }
 
-        // Try as Dict
-        if let Value::Dict(dict_val) = &value {
-            for (k, v_inner) in dict_val.iter() {
-                // k and v_inner are &Value
-                if let (Value::Str(key_str), Value::Str(val_str)) = (k, v_inner) {
-                    result.insert(key_str.to_string(), val_str.to_string());
-                }
-            }
-        }
-
-        // Fallback: try parsing from string representation
-        if result.is_empty() {
-            let s = v.to_string();
-            info!("Trying string parse from: {}", s);
-
-            // Format from NetworkManager is often "key = value, key2 = value2"
-            // when converted to string
-            for pair in s.split(", ") {
-                if let Some((k, val)) = pair.split_once(" = ") {
-                    let k = k.trim().trim_matches('"');
-                    let val = val.trim().trim_matches('"');
-                    if !k.is_empty() && !val.is_empty() {
-                        result.insert(k.to_string(), val.to_string());
-                    }
-                }
-            }
-        }
-
-        info!("Parsed vpn.data result: {:?}", result);
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    })
+    #[test]
+    fn openvpn_args_let_management_drive_authentication() {
+        let config =
+            ConnectionConfig::from_nm_settings(&nm_settings(&[("config", "/etc/vpn/prod.ovpn")]))
+                .unwrap();
+        let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock");
+        let joined = args.join(" ");
+        assert!(joined.starts_with("--config /etc/vpn/prod.ovpn "));
+        assert!(joined.contains("--auth-user-pass --auth-retry interact"));
+        assert!(joined.contains(
+            "--management /run/nm-openvpn-sso/x.sock unix --management-query-passwords --management-hold"
+        ));
+    }
 }

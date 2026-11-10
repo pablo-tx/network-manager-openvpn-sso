@@ -2,9 +2,13 @@
 Description=OpenVPN SSO Browser Trigger
 
 [Path]
-PathChanged=/run/nm-openvpn-sso
-TriggerLimitIntervalSec=5s
-TriggerLimitBurst=5
+# The plugin (running as root) drops SSO URLs into /run/nm-openvpn-sso/<uid>/.
+# PathExistsGlob re-checks after every service run, so a URL that arrives
+# while the service is still busy is not lost (PathChanged on the parent
+# directory only fired on unrelated socket/chmod events).
+PathExistsGlob=/run/nm-openvpn-sso/%U/*.url
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=10
 
 [Install]
 WantedBy=default.target

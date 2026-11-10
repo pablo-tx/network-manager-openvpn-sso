@@ -24,8 +24,8 @@ use url::Url;
 /// For OpenVPN web-auth, the server handles the OAuth callback itself.
 /// We just need to open the browser and return immediately - the server
 /// will signal auth success through the management interface.
-pub async fn authenticate(auth_url: &str, _state: Option<&str>) -> Result<()> {
-    let _url = Url::parse(auth_url).context("Invalid auth URL")?;
+pub async fn authenticate(auth_url: &str) -> Result<()> {
+    Url::parse(auth_url).context("Invalid auth URL")?;
 
     info!("Opening browser for server-handled OAuth authentication");
 
@@ -53,6 +53,34 @@ pub async fn authenticate(auth_url: &str, _state: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// If the SSO URL uses the localhost-callback flow (its `redirect_uri`
+/// points at this machine), return the VPN server's base URL, where the
+/// authorization code is forwarded. Returns None for native OpenVPN webauth,
+/// where the server completes authentication by itself.
+pub fn localhost_callback_base(auth_url: &str) -> Option<String> {
+    let url = Url::parse(auth_url).ok()?;
+    // query_pairs() percent-decodes, so encoded redirect URIs are recognized
+    let redirect = url
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .and_then(|(_, value)| Url::parse(&value).ok())?;
+    let is_loopback = match redirect.host()? {
+        url::Host::Domain(domain) => domain == "localhost",
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    is_loopback.then(|| url.origin().ascii_serialization())
+}
+
+/// Aborts a background task when dropped, on every exit path
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The localhost port for receiving the OAuth callback from Google.
 /// This must match CLIENT_OAUTH_CALLBACK_PORT on the server side.
 const LOCAL_OAUTH_CALLBACK_PORT: u16 = 19823;
@@ -74,13 +102,24 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
     let (callback_tx, callback_rx) = oneshot::channel::<Result<(String, String)>>();
     let callback_tx = Arc::new(tokio::sync::Mutex::new(Some(callback_tx)));
 
-    // Start localhost callback server
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", LOCAL_OAUTH_CALLBACK_PORT))
-        .await
-        .context(format!(
-            "Failed to bind localhost:{}",
-            LOCAL_OAUTH_CALLBACK_PORT
-        ))?;
+    // Start localhost callback server. A previous attempt that was just
+    // aborted may not have released the port yet, so retry briefly.
+    let mut attempts = 0;
+    let listener = loop {
+        match TcpListener::bind(("127.0.0.1", LOCAL_OAUTH_CALLBACK_PORT)).await {
+            Ok(listener) => break listener,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                return Err(e).context(format!(
+                    "Failed to bind localhost:{}",
+                    LOCAL_OAUTH_CALLBACK_PORT
+                ))
+            }
+        }
+    };
     info!(
         "OAuth callback server listening on localhost:{}",
         LOCAL_OAUTH_CALLBACK_PORT
@@ -95,12 +134,14 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
         .route("/oauth/callback", get(handle_sso_callback))
         .with_state(Arc::new(callback_state));
 
-    let server_handle = tokio::spawn(async move {
+    // Stopped whenever this function returns, including on timeout or error,
+    // so the port is free for the next authentication round
+    let _server = AbortOnDrop(tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .map_err(|e| error!("OAuth callback server error: {}", e))
             .ok();
-    });
+    }));
 
     // Open browser
     let url_owned = auth_url.to_string();
@@ -158,9 +199,6 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
         error!("VPN server rejected OAuth: {} - {}", status, body);
         return Err(anyhow!("VPN server rejected authentication: {}", body));
     }
-
-    // Clean up
-    server_handle.abort();
 
     Ok(())
 }
@@ -307,10 +345,10 @@ fn try_open_browser(url: &str) -> bool {
     }
 
     let filename = format!("{}/sso-{}.url", user_dir, std::process::id());
-    match std::fs::write(&filename, url) {
-        Ok(_) => {
+    let temp_filename = format!("{}/.sso-{}.tmp", user_dir, std::process::id());
+    match write_url_file(&temp_filename, &filename, url) {
+        Ok(()) => {
             info!("Wrote URL to {} for systemd path activation", filename);
-            std::thread::sleep(std::time::Duration::from_millis(500));
             true
         }
         Err(e) => {
@@ -318,6 +356,26 @@ fn try_open_browser(url: &str) -> bool {
             false
         }
     }
+}
+
+/// Publish the URL file atomically: the path unit must never see a partially
+/// written file. The directory may be world-writable (when chown is denied),
+/// so create the temp file with O_EXCL, which refuses to follow a planted
+/// symlink, and rename() over the destination, which replaces rather than
+/// follows one.
+fn write_url_file(temp_path: &str, path: &str, url: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _ = std::fs::remove_file(temp_path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(temp_path)?;
+    file.write_all(url.as_bytes())?;
+    drop(file);
+    std::fs::rename(temp_path, path)
 }
 
 /// Find the username of an active graphical session
@@ -462,6 +520,64 @@ fn error_page(message: &str) -> String {
     </div>
 </body>
 </html>"#,
-        message
+        html_escape(message)
     )
+}
+
+/// Escape text for HTML. The error page shows `error_description` from the
+/// callback query string, which anyone can put in a localhost link.
+fn html_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_localhost_callback_flow() {
+        assert_eq!(
+            localhost_callback_base(
+                "https://vpn.example.com:9000/auth/start?redirect_uri=http://127.0.0.1:19823/oauth/callback"
+            ),
+            Some("https://vpn.example.com:9000".into())
+        );
+        // Percent-encoded redirect_uri (missed by the old substring check);
+        // default port is not replaced by 9000
+        assert_eq!(
+            localhost_callback_base(
+                "https://vpn.example.com/auth/start?redirect_uri=http%3A%2F%2Flocalhost%3A19823%2Fcb"
+            ),
+            Some("https://vpn.example.com".into())
+        );
+        // Native webauth: no redirect_uri, or one pointing elsewhere
+        assert_eq!(
+            localhost_callback_base("https://vpn.example.com:9000/oauth2/start?state=abc"),
+            None
+        );
+        assert_eq!(
+            localhost_callback_base(
+                "https://idp.example.com/authorize?redirect_uri=https://vpn.example.com/callback"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn error_page_escapes_message() {
+        let page = error_page("<script>alert('x')</script>");
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
+    }
 }
