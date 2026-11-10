@@ -148,9 +148,23 @@ impl ConnectionConfig {
         })
     }
 
-    /// Username sent with placeholder credentials and with cached tokens.
-    /// Both must use the same value: OpenVPN auth-tokens are bound to the
-    /// username they were issued for.
+    /// Whether OpenVPN should request a username/password: the profile sets
+    /// a username, or (without a .ovpn file) uses a password connection
+    /// type. A .ovpn file with its own `auth-user-pass` also triggers the
+    /// request, answered with [`auth_username`](Self::auth_username).
+    pub fn uses_credentials(&self) -> bool {
+        self.username.is_some()
+            || (self.config_path.is_none()
+                && matches!(
+                    self.connection_type.as_deref(),
+                    Some("password" | "password-tls")
+                ))
+    }
+
+    /// Username sent when OpenVPN requests credentials, both with
+    /// placeholder passwords and with cached tokens. Both must use the same
+    /// value: OpenVPN auth-tokens are bound to the username they were
+    /// issued for.
     pub fn auth_username(&self) -> &str {
         self.username.as_deref().unwrap_or("oauth")
     }
@@ -250,15 +264,20 @@ impl ConnectionConfig {
             "webauth,openurl".to_string(),
         ]);
 
-        // Prevent OpenVPN from auto-sending empty credentials before the
-        // management interface can respond. With --management-query-passwords,
-        // OpenVPN will query the management interface for credentials.
-        args.push("--auth-user-pass".to_string());
+        // Only ask for credentials when the profile defines them; OpenVPN
+        // then queries the management interface (--management-query-passwords).
+        // Without them, connect like a stock client with an empty username:
+        // SSO servers such as openvpn-auth-oauth2 then set the session
+        // username themselves and push it with the auth-token
+        // (auth-token-user), so renegotiation can reuse the token. A
+        // placeholder username prevents that push, and the server rejects
+        // the token at the next renegotiation.
+        if self.uses_credentials() {
+            args.push("--auth-user-pass".to_string());
+        }
 
-        // On an authentication failure (expired auth-token, rejected cached
-        // token, SSO timeout) restart and ask the management interface for
-        // credentials again instead of exiting. This is what lets a session
-        // re-authenticate without tearing the tunnel down.
+        // On an authentication failure (expired auth-token, SSO timeout)
+        // restart and authenticate again instead of exiting.
         args.extend(["--auth-retry".to_string(), "interact".to_string()]);
 
         // Common: management interface
@@ -384,16 +403,35 @@ mod tests {
     }
 
     #[test]
-    fn openvpn_args_let_management_drive_authentication() {
+    fn openvpn_args_without_username_send_no_credentials() {
+        // Like a stock client: an empty username lets the SSO server set the
+        // session username and push it with the auth-token
         let config =
             ConnectionConfig::from_nm_settings(&nm_settings(&[("config", "/etc/vpn/prod.ovpn")]))
                 .unwrap();
+        assert!(!config.uses_credentials());
         let args = config.build_openvpn_args("/run/nm-openvpn-sso/x.sock");
         let joined = args.join(" ");
         assert!(joined.starts_with("--config /etc/vpn/prod.ovpn "));
-        assert!(joined.contains("--auth-user-pass --auth-retry interact"));
+        assert!(!args.iter().any(|a| a == "--auth-user-pass"));
+        assert!(joined.contains("--auth-retry interact"));
         assert!(joined.contains(
             "--management /run/nm-openvpn-sso/x.sock unix --management-query-passwords --management-hold"
         ));
+    }
+
+    #[test]
+    fn openvpn_args_with_username_request_credentials() {
+        let config = ConnectionConfig::from_nm_settings(&nm_settings(&[
+            ("config", "/etc/vpn/prod.ovpn"),
+            ("username", "pablo@example.com"),
+        ]))
+        .unwrap();
+        assert!(config.uses_credentials());
+        assert_eq!(config.auth_username(), "pablo@example.com");
+        let joined = config
+            .build_openvpn_args("/run/nm-openvpn-sso/x.sock")
+            .join(" ");
+        assert!(joined.contains("--auth-user-pass --auth-retry interact"));
     }
 }

@@ -105,11 +105,18 @@ pub struct VpnConfig {
     pub remote_ip: Option<Ipv4Addr>,
 }
 
-/// What we answered the most recent credential request with
+/// Where the current authentication round stands. Decides whether an
+/// authentication failure counts towards [`MAX_SSO_FAILURES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Credentials {
+enum Round {
+    /// Connecting interactively: placeholder credentials and/or SSO login
+    Interactive,
+    /// We sent the cached auth-token; rejection is expected once it expires
     CachedToken,
-    Placeholder,
+    /// Tunnel is up; a failure is the server rejecting the session token
+    Connected,
+    /// This round's failure was already handled
+    Failed,
 }
 
 /// Side effects requested by [`Protocol`]
@@ -141,8 +148,8 @@ struct Protocol {
     password: String,
     /// Auth-token from an earlier connection, tried once before SSO
     cached_token: Option<String>,
-    /// What we sent for the current credential request
-    last_sent: Option<Credentials>,
+    /// State of the current authentication round
+    round: Round,
     /// SSO URL already opened in the current authentication round
     opened_url: Option<String>,
     /// SSO rounds that failed since the tunnel was last up
@@ -155,7 +162,7 @@ impl Protocol {
             username: username.to_string(),
             password: password.to_string(),
             cached_token,
-            last_sent: None,
+            round: Round::Interactive,
             opened_url: None,
             sso_failures: 0,
         }
@@ -215,20 +222,14 @@ impl Protocol {
         self.opened_url = None;
 
         if self.sso_failures >= MAX_SSO_FAILURES {
-            return vec![Action::Fail {
-                reason: format!(
-                    "SSO authentication failed {} times in a row",
-                    self.sso_failures
-                ),
-                kind: FailureKind::Login,
-            }];
+            return vec![self.give_up()];
         }
 
-        let (kind, password) = match self.cached_token.take() {
-            Some(token) => (Credentials::CachedToken, token),
-            None => (Credentials::Placeholder, self.password.clone()),
+        let (round, password) = match self.cached_token.take() {
+            Some(token) => (Round::CachedToken, token),
+            None => (Round::Interactive, self.password.clone()),
         };
-        self.last_sent = Some(kind);
+        self.round = round;
 
         // The username must be the same for placeholder credentials and
         // cached tokens: OpenVPN auth-tokens are bound to the username.
@@ -250,15 +251,37 @@ impl Protocol {
         // --auth-retry interact OpenVPN restarts and asks for credentials
         // again, and the next round goes through SSO.
         let mut actions = vec![Action::ClearCachedToken];
-
-        if self.last_sent.take() == Some(Credentials::Placeholder) {
-            // The interactive SSO round itself failed (timeout, denied login)
-            self.sso_failures += 1;
-        }
+        actions.extend(self.on_auth_failure());
         if let Some(url) = extract_auth_url(msg) {
             actions.extend(self.open_url(url));
         }
         actions
+    }
+
+    /// Handle an authentication failure, reported as ">PASSWORD:Verification
+    /// Failed" and/or "RECONNECTING,auth-failure". Only a failed interactive
+    /// round (SSO timeout, denied login, rejected placeholder) counts; the
+    /// round is marked so the second signal for the same failure is ignored.
+    fn on_auth_failure(&mut self) -> Vec<Action> {
+        let round = std::mem::replace(&mut self.round, Round::Failed);
+        if round != Round::Interactive {
+            return Vec::new();
+        }
+        self.sso_failures += 1;
+        if self.sso_failures >= MAX_SSO_FAILURES {
+            return vec![self.give_up()];
+        }
+        Vec::new()
+    }
+
+    fn give_up(&self) -> Action {
+        Action::Fail {
+            reason: format!(
+                "SSO authentication failed {} times in a row",
+                self.sso_failures
+            ),
+            kind: FailureKind::Login,
+        }
     }
 
     fn on_state(&mut self, msg: &str) -> Vec<Action> {
@@ -267,7 +290,14 @@ impl Protocol {
         let field = |i: usize| fields.get(i).copied().filter(|s| !s.is_empty());
 
         let state = match field(1).unwrap_or_default() {
-            "CONNECTING" | "WAIT" | "RESOLVE" | "TCP_CONNECT" => VpnState::Connecting,
+            "CONNECTING" | "WAIT" | "RESOLVE" | "TCP_CONNECT" => {
+                // A new connection attempt starts a new round. Without
+                // credentials there is no password request to mark it.
+                if self.round == Round::Failed {
+                    self.round = Round::Interactive;
+                }
+                VpnState::Connecting
+            }
             "AUTH" => VpnState::Authenticating,
             "AUTH_PENDING" => {
                 let mut actions = extract_open_url(msg)
@@ -279,14 +309,22 @@ impl Protocol {
             "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => VpnState::GettingConfig,
             "CONNECTED" => {
                 self.sso_failures = 0;
-                self.last_sent = None;
+                self.round = Round::Connected;
                 self.opened_url = None;
                 return vec![Action::Connected {
                     local_ip: field(3).and_then(|s| s.parse().ok()),
                     remote_ip: field(4).and_then(|s| s.parse().ok()),
                 }];
             }
-            "RECONNECTING" => VpnState::Reconnecting,
+            "RECONNECTING" => {
+                let mut actions = if field(2).is_some_and(|d| d.starts_with("auth-failure")) {
+                    self.on_auth_failure()
+                } else {
+                    Vec::new()
+                };
+                actions.push(Action::Emit(VpnEvent::State(VpnState::Reconnecting)));
+                return actions;
+            }
             "EXITING" => VpnState::Stopping,
             _ => return Vec::new(),
         };
@@ -300,6 +338,7 @@ impl Protocol {
             return Vec::new();
         }
         self.opened_url = Some(url.clone());
+        self.round = Round::Interactive;
         vec![Action::OpenBrowser(url)]
     }
 }
@@ -372,10 +411,15 @@ impl OpenVpnManager {
             }
         };
 
-        let cached_token = secrets::get_cached_credentials(&self.config.uuid)
-            .await
-            .filter(|tokens| tokens.is_valid())
-            .map(|tokens| tokens.access_token);
+        // A cached token can only be offered when OpenVPN asks for credentials
+        let cached_token = if self.config.uses_credentials() {
+            secrets::get_cached_credentials(&self.config.uuid)
+                .await
+                .filter(|tokens| tokens.is_valid())
+                .map(|tokens| tokens.access_token)
+        } else {
+            None
+        };
         if cached_token.is_some() {
             info!("Found cached auth-token, trying it before SSO");
         }
@@ -1025,24 +1069,133 @@ mod tests {
         assert_eq!(p.sso_failures, 0);
     }
 
+    fn give_up() -> Action {
+        Action::Fail {
+            reason: format!("SSO authentication failed {MAX_SSO_FAILURES} times in a row"),
+            kind: FailureKind::Login,
+        }
+    }
+
     #[test]
     fn gives_up_after_repeated_sso_failures() {
         let mut p = Protocol::new("oauth", "oauth", None);
-        for round in 0..MAX_SSO_FAILURES {
+        for round in 1..MAX_SSO_FAILURES {
             assert_eq!(
                 feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
                 placeholder_credentials(),
                 "round {round}"
             );
-            feed(&mut p, &[">PASSWORD:Verification Failed: 'Auth'"]);
+            assert_eq!(
+                feed(
+                    &mut p,
+                    &[
+                        ">PASSWORD:Verification Failed: 'Auth'",
+                        ">STATE:1,RECONNECTING,auth-failure,,,,,",
+                    ]
+                ),
+                vec![Action::ClearCachedToken, state(VpnState::Reconnecting)],
+                "round {round}"
+            );
+            // Both failure signals together count once
+            assert_eq!(p.sso_failures, round);
         }
+        feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]);
+        assert_eq!(
+            feed(&mut p, &[">PASSWORD:Verification Failed: 'Auth'"]),
+            vec![Action::ClearCachedToken, give_up()]
+        );
+        // Any further credential request is refused too
         assert_eq!(
             feed(&mut p, &[">PASSWORD:Need 'Auth' username/password"]),
-            vec![Action::Fail {
-                reason: format!("SSO authentication failed {MAX_SSO_FAILURES} times in a row"),
-                kind: FailureKind::Login,
-            }]
+            vec![give_up()]
         );
+    }
+
+    /// Without credentials (stock-client behavior) OpenVPN never asks for a
+    /// password: the SSO URL arrives directly, and failures are recognized
+    /// from the browser login that did not complete.
+    #[test]
+    fn sso_without_credentials_connects_and_counts_failures() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        let failed_round = |p: &mut Protocol, n: u32| {
+            feed(
+                p,
+                &[
+                    ">HOLD:Waiting for hold release:0",
+                    ">STATE:1,RESOLVE,,,,,,",
+                    ">STATE:1,AUTH,,,,,,",
+                    ">STATE:1,AUTH_PENDING,timeout 180,,,,,",
+                    &format!(">INFOMSG:WEB_AUTH::https://vpn.example.com/oauth2/start?state={n}"),
+                    ">PASSWORD:Verification Failed: 'Auth'",
+                    ">STATE:1,RECONNECTING,auth-failure,,,,,",
+                ],
+            )
+        };
+
+        let first = failed_round(&mut p, 1);
+        assert!(first.contains(&send("hold release\n")));
+        assert!(first.contains(&Action::OpenBrowser(
+            "https://vpn.example.com/oauth2/start?state=1".into()
+        )));
+        assert!(!first
+            .iter()
+            .any(|a| matches!(a, Action::Send(c) if c.starts_with("username"))));
+        assert_eq!(p.sso_failures, 1);
+
+        assert!(!failed_round(&mut p, 2).contains(&give_up()));
+        assert!(failed_round(&mut p, 3).contains(&give_up()));
+    }
+
+    #[test]
+    fn rejected_session_token_without_credentials_reopens_browser() {
+        let mut p = Protocol::new("oauth", "oauth", None);
+        feed(
+            &mut p,
+            &[
+                ">STATE:1,AUTH_PENDING,timeout 180,,,,,",
+                ">INFOMSG:WEB_AUTH::https://vpn.example.com/oauth2/start?state=a",
+                ">STATE:2,CONNECTED,SUCCESS,10.8.0.5,52.19.23.151,1194,,,",
+            ],
+        );
+        assert_eq!(
+            feed(
+                &mut p,
+                &[
+                    ">PASSWORD:Verification Failed: 'Auth'",
+                    ">STATE:3,RECONNECTING,auth-failure (auth-token),,,,,",
+                    ">HOLD:Waiting for hold release:2",
+                    ">STATE:4,RESOLVE,,,,,,",
+                    ">INFOMSG:WEB_AUTH::https://vpn.example.com/oauth2/start?state=b",
+                ]
+            ),
+            vec![
+                Action::ClearCachedToken,
+                state(VpnState::Reconnecting),
+                send("hold release\n"),
+                state(VpnState::Connecting),
+                Action::OpenBrowser("https://vpn.example.com/oauth2/start?state=b".into()),
+            ]
+        );
+        // The rejected session token is expected, not an SSO failure
+        assert_eq!(p.sso_failures, 0);
+    }
+
+    #[test]
+    fn immediate_rejections_without_browser_still_give_up() {
+        // Guards against a tight reconnect loop when the server rejects us
+        // before any SSO login (hold release skips OpenVPN's retry pause)
+        let mut p = Protocol::new("oauth", "oauth", None);
+        let mut actions = Vec::new();
+        for _ in 0..MAX_SSO_FAILURES {
+            actions = feed(
+                &mut p,
+                &[
+                    ">STATE:1,RESOLVE,,,,,,",
+                    ">STATE:1,RECONNECTING,auth-failure,,,,,",
+                ],
+            );
+        }
+        assert!(actions.contains(&give_up()));
     }
 
     #[test]
