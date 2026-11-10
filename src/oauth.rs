@@ -13,6 +13,7 @@ use axum::{
 use notify_rust::Notification;
 use serde::Deserialize;
 use std::os::unix::fs::{chown, PermissionsExt};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -284,8 +285,8 @@ h1{color:#4ecca3;margin-bottom:10px}p{color:#aaa}.spinner{width:40px;height:40px
 /// `openvpn-sso-browser.service` (triggered by `openvpn-sso-browser.path`)
 /// picks it up and runs `xdg-open` in the user's correct SELinux context.
 ///
-/// The per-user subdirectory is chowned to the user so the service can
-/// delete the URL file after processing.
+/// The user gets write access to the per-user subdirectory (see
+/// [`grant_user_access`]) so the service can delete the URL file.
 ///
 /// Returns true if the URL file was written successfully.
 fn try_open_browser(url: &str) -> bool {
@@ -309,8 +310,6 @@ fn try_open_browser(url: &str) -> bool {
     // SELinux blocks NetworkManager_t from writing to user_tmp_t
     // (/run/user/$UID), but NetworkManager_t CAN write to
     // NetworkManager_var_run_t (/run/nm-openvpn-sso/).
-    // The per-user directory is chowned to the user so their systemd
-    // service can delete URL files after processing.
     let base_dir = "/run/nm-openvpn-sso";
     let user_dir = format!("{}/{}", base_dir, uid);
 
@@ -324,23 +323,8 @@ fn try_open_browser(url: &str) -> bool {
         return false;
     }
 
-    // Try to chown the per-user directory to the user so they can
-    // manage files within it. Falls back to world-writable if chown
-    // is denied by SELinux.
-    if chown(&user_dir, Some(uid), Some(uid)).is_err() {
-        warn!(
-            "Failed to chown {} to uid {}, falling back to world-writable",
-            user_dir, uid
-        );
-        if let Err(e) = std::fs::set_permissions(&user_dir, std::fs::Permissions::from_mode(0o777))
-        {
-            warn!("Failed to set permissions on {}: {}", user_dir, e);
-            return false;
-        }
-    } else if let Err(e) =
-        std::fs::set_permissions(&user_dir, std::fs::Permissions::from_mode(0o700))
-    {
-        warn!("Failed to set permissions on {}: {}", user_dir, e);
+    if let Err(e) = grant_user_access(Path::new(&user_dir), uid) {
+        warn!("Failed to give uid {} access to {}: {}", uid, user_dir, e);
         return false;
     }
 
@@ -358,9 +342,79 @@ fn try_open_browser(url: &str) -> bool {
     }
 }
 
+/// Let `uid` remove URL files from `dir` and nobody else touch it. chown
+/// fails under NetworkManager (its unit drops CAP_CHOWN); a POSIX ACL needs
+/// no capability because the plugin owns the directory. World-writable is
+/// the last resort.
+fn grant_user_access(dir: &Path, uid: u32) -> std::io::Result<()> {
+    let private = std::fs::Permissions::from_mode(0o700);
+    if chown(dir, Some(uid), Some(uid)).is_ok() {
+        return std::fs::set_permissions(dir, private);
+    }
+    std::fs::set_permissions(dir, private)?;
+    if let Err(e) = set_xattr(dir, c"system.posix_acl_access", &user_acl(uid)) {
+        warn!(
+            "Failed to set an ACL on {}, falling back to world-writable: {}",
+            dir.display(),
+            e
+        );
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))?;
+    }
+    Ok(())
+}
+
+/// `system.posix_acl_access` value granting the owner and `uid` rwx and
+/// everyone else nothing (user::rwx, user:uid:rwx, group::---, mask::rwx,
+/// other::---). Layout from linux/posix_acl_xattr.h: a version header, then
+/// (tag, perm, id) entries sorted by tag.
+fn user_acl(uid: u32) -> Vec<u8> {
+    const VERSION: u32 = 2;
+    const UNDEFINED_ID: u32 = u32::MAX;
+    const USER_OBJ: u16 = 0x01;
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    let entries = [
+        (USER_OBJ, 7u16, UNDEFINED_ID),
+        (USER, 7, uid),
+        (GROUP_OBJ, 0, UNDEFINED_ID),
+        (MASK, 7, UNDEFINED_ID),
+        (OTHER, 0, UNDEFINED_ID),
+    ];
+    let mut value = VERSION.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        value.extend(tag.to_le_bytes());
+        value.extend(perm.to_le_bytes());
+        value.extend(id.to_le_bytes());
+    }
+    value
+}
+
+fn set_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: both strings are NUL-terminated and value.len() bytes are
+    // readable at value.as_ptr()
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Publish the URL file atomically: the path unit must never see a partially
-/// written file. The directory may be world-writable (when chown is denied),
-/// so create the temp file with O_EXCL, which refuses to follow a planted
+/// written file. The directory may be world-writable (if no ACL could be
+/// set), so create the temp file with O_EXCL, which refuses to follow a planted
 /// symlink, and rename() over the destination, which replaces rather than
 /// follows one.
 fn write_url_file(temp_path: &str, path: &str, url: &str) -> std::io::Result<()> {
@@ -579,5 +633,20 @@ mod tests {
         let page = error_page("<script>alert('x')</script>");
         assert!(!page.contains("<script>"));
         assert!(page.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
+    }
+
+    #[test]
+    fn user_acl_matches_kernel_layout() {
+        // As produced by `setfacl -m u:1000:rwx,g::-,o::-` on a 0700 directory
+        let expected: Vec<u8> = [
+            &[2, 0, 0, 0][..],
+            &[0x01, 0, 7, 0, 0xff, 0xff, 0xff, 0xff],
+            &[0x02, 0, 7, 0, 0xe8, 0x03, 0, 0],
+            &[0x04, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+            &[0x10, 0, 7, 0, 0xff, 0xff, 0xff, 0xff],
+            &[0x20, 0, 0, 0, 0xff, 0xff, 0xff, 0xff],
+        ]
+        .concat();
+        assert_eq!(user_acl(1000), expected);
     }
 }

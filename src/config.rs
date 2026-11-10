@@ -308,12 +308,15 @@ impl ConnectionConfig {
         // restart and authenticate again instead of exiting.
         args.extend(["--auth-retry".to_string(), "interact".to_string()]);
 
-        // Common: management interface. No --script-security: the plugin
-        // runs no scripts, and a root-owned .ovpn file sets its own level.
+        // Common: management interface, for root only (the socket itself is
+        // created world-accessible). No --script-security: the plugin runs
+        // no scripts, and a root-owned .ovpn file sets its own level.
         args.extend([
             "--management".to_string(),
             management_socket.to_string(),
             "unix".to_string(),
+            "--management-client-user".to_string(),
+            "root".to_string(),
             "--management-query-passwords".to_string(),
             "--management-hold".to_string(),
         ]);
@@ -464,7 +467,8 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--auth-user-pass"));
         assert!(joined.contains("--auth-retry interact"));
         assert!(joined.contains(
-            "--management /run/nm-openvpn-sso/x.sock unix --management-query-passwords --management-hold"
+            "--management /run/nm-openvpn-sso/x.sock unix --management-client-user root \
+             --management-query-passwords --management-hold"
         ));
     }
 
