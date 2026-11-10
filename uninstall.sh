@@ -31,6 +31,8 @@ rm -f "$LIBDIR/systemd/user/openvpn-sso-browser.path"
 rm -f "$LIBDIR/systemd/user/openvpn-sso-browser.service"
 rm -f "$LIBDIR/systemd/user/default.target.wants/openvpn-sso-browser.path"
 rm -rf /run/nm-openvpn-sso/
+# Cached session tokens
+rm -rf /var/lib/nm-openvpn-sso/
 
 info "Reloading daemons..."
 systemctl daemon-reload

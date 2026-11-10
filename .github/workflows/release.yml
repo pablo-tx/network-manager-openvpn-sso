@@ -163,7 +163,9 @@ jobs:
         run: strip target/release/nm-openvpn-sso-service
 
       - name: Build .rpm package
-        run: cargo generate-rpm
+        # Only direct library dependencies; the builtin ldd closure adds
+        # libraries some systems cannot provide (see the script)
+        run: cargo generate-rpm --auto-req packaging/rpm-find-requires.sh
 
       - name: Rename package with version
         run: |
