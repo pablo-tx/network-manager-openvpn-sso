@@ -185,29 +185,61 @@ fn ancestors_root_controlled(dir: &Path) -> Result<bool> {
 /// Open a file without following symlinks anywhere in the path. Callers
 /// canonicalize first; a symlink that appears afterwards fails the open, so
 /// the file read is the file that was checked.
+///
+/// Walks the path one directory at a time with O_NOFOLLOW rather than using
+/// openat2(RESOLVE_NO_SYMLINKS): NetworkManager.service sets
+/// RestrictSUIDSGID=, whose seccomp filter makes openat2 fail with ENOSYS
+/// in NetworkManager and in the plugins it starts.
 fn open_no_symlinks(path: &Path) -> std::io::Result<File> {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: open_how is plain data; all-zero is its documented default
-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    // O_NONBLOCK: a FIFO must not block the service; regular files ignore it
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK) as u64;
-    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
-    // SAFETY: c_path is NUL-terminated and `how` is a valid open_how whose
-    // size is passed alongside it
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            &how as *const libc::open_how,
-            std::mem::size_of::<libc::open_how>(),
+    use std::path::Component;
+
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a canonical absolute path", path.display()),
         )
     };
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(invalid());
+    }
+    let names = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(invalid()),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let Some((file_name, dir_names)) = names.split_last() else {
+        return Err(invalid());
+    };
+
+    // O_DIRECTORY makes a symlinked directory fail with ENOTDIR
+    let dir_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut dir = open_at(None, std::ffi::OsStr::new("/"), dir_flags)?;
+    for name in dir_names {
+        dir = open_at(Some(&dir), name, dir_flags)?;
+    }
+    // O_NONBLOCK: a FIFO must not block the service; regular files ignore it
+    open_at(
+        Some(&dir),
+        file_name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK,
+    )
+}
+
+/// openat(2) relative to `dir`, or to the working directory without one
+fn open_at(dir: Option<&File>, name: &std::ffi::OsStr, flags: i32) -> std::io::Result<File> {
+    use std::os::fd::AsRawFd;
+
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    let dir_fd = dir.map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd());
+    // SAFETY: name is NUL-terminated and dir_fd is open (or AT_FDCWD)
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: the kernel returned a new descriptor that nothing else owns
-    Ok(unsafe { File::from_raw_fd(fd as i32) })
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Read a regular file, refusing symlinks and oversized files
@@ -644,5 +676,43 @@ mod tests {
             strip_management_directives("client\nmanagement 127.0.0.1 7505\n  management-hold\n"),
             Some("client\n".to_string())
         );
+    }
+
+    /// Scratch directory under target/, with symlinks resolved
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    #[test]
+    fn opens_files_without_following_symlinks() {
+        let dir = scratch_dir("ovpn-open-test");
+        std::fs::write(dir.join("real/vpn.ovpn"), "client\n").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("vpn.ovpn", dir.join("real/alias.ovpn")).unwrap();
+
+        let (_, contents) = read_file(&dir.join("real/vpn.ovpn")).unwrap();
+        assert_eq!(contents, b"client\n");
+        // A symlinked directory or file is refused, not followed
+        assert!(read_file(&dir.join("link/vpn.ovpn")).is_err());
+        assert!(read_file(&dir.join("real/alias.ovpn")).is_err());
+        // Not a regular file
+        assert!(read_file(&dir.join("real")).is_err());
+
+        // A user-owned file takes the restricted-copy path
+        match prepare(&dir.join("real/vpn.ovpn")).unwrap() {
+            Prepared::Copy {
+                text, untrusted, ..
+            } => {
+                assert_eq!(text, "client\n");
+                assert!(untrusted);
+            }
+            other => panic!("expected a restricted copy, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
